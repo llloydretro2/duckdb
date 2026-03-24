@@ -10,6 +10,7 @@
 
 #include "duckdb/main/setting_info.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/enums/hash_join_backend.hpp"
 
 namespace duckdb {
 
@@ -686,6 +687,20 @@ struct DynamicOrFilterThresholdSetting {
 	static constexpr const char *DefaultValue = "50";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct HashJoinBackendSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "hash_join_backend";
+	static constexpr const char *Description =
+	    "Selects the physical hash join backend implementation (LINEAR or CUCKOO).";
+	static constexpr const char *InputType = "VARCHAR";
+	static constexpr const char *DefaultValue = "LINEAR";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
 };
 
 struct EnableExternalAccessSetting {

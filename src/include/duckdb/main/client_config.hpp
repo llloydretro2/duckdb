@@ -19,6 +19,7 @@
 #include "duckdb/parser/expression/lambda_expression.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/user_settings.hpp"
+#include "duckdb/common/enums/hash_join_backend.hpp"
 
 namespace duckdb {
 
@@ -109,6 +110,9 @@ struct ClientConfig {
 	//! **DEPRECATED** The file to save query HTTP logging information to, instead of printing it to the console
 	//! (empty = output to the DuckDB logger)
 	string http_logging_output;
+
+	//! Hash join backend selection (linear probing vs. cuckoo prototype, etc.)
+	HashJoinBackend hash_join_backend = HashJoinBackend::LINEAR;
 
 public:
 	static ClientConfig &GetConfig(ClientContext &context);

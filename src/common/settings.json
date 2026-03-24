@@ -446,6 +446,15 @@
         "default_value": "50"
     },
     {
+        "name": "hash_join_backend",
+        "description": "Selects the physical hash join backend implementation (LINEAR or CUCKOO).",
+        "type": "VARCHAR",
+        "default_scope": "local",
+        "default_value": "LINEAR",
+        "struct": "HashJoinBackendSetting",
+        "custom_implementation": true
+    },
+    {
         "name": "enable_external_access",
         "description": "Allow the database to access external state (through e.g. loading/installing modules, COPY TO/FROM, CSV \"\n\t    \"readers, pandas replacement scans, etc)",
         "type": "BOOLEAN",

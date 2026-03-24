@@ -14,6 +14,7 @@
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/filter_combiner.hpp"
@@ -410,6 +411,12 @@ public:
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context,
                                                                 const idx_t initial_radix_bits) const {
+	auto backend = ClientConfig::GetConfig(context).hash_join_backend;
+	if (backend == HashJoinBackend::CUCKOO) {
+		throw NotImplementedException(
+		    "hash_join_backend=CUCKOO is not implemented yet. Please switch back to LINEAR until the "
+		    "cuckoo hash table backend is available.");
+	}
 	auto result =
 	    make_uniq<JoinHashTable>(context, *this, conditions, payload_columns.col_types, join_type, initial_radix_bits,
 	                             rhs_output_columns.col_idxs, residual_info ? residual_info->Copy() : nullptr,

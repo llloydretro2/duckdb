@@ -1695,4 +1695,45 @@ void CurrentTransactionInvalidationPolicySetting::OnSet(SettingCallbackInfo &inf
 	info.context->transaction.SetInvalidationPolicy(
 	    EnumUtil::FromString<TransactionInvalidationPolicy>(input.GetValue<string>()));
 }
+
+namespace {
+
+HashJoinBackend ParseHashJoinBackend(const string &input) {
+	auto lowered = StringUtil::Lower(input);
+	if (lowered == "linear") {
+		return HashJoinBackend::LINEAR;
+	}
+	if (lowered == "cuckoo") {
+		return HashJoinBackend::CUCKOO;
+	}
+	throw InvalidInputException("Invalid hash_join_backend value \"%s\". Supported values are LINEAR and CUCKOO.",
+	                            input);
+}
+
+const char *HashJoinBackendToString(HashJoinBackend backend) {
+	switch (backend) {
+	case HashJoinBackend::LINEAR:
+		return "LINEAR";
+	case HashJoinBackend::CUCKOO:
+		return "CUCKOO";
+	default:
+		throw InternalException("Unknown HashJoinBackend value");
+	}
+}
+
+} // namespace
+
+void HashJoinBackendSetting::SetLocal(ClientContext &context, const Value &parameter) {
+	auto backend = ParseHashJoinBackend(StringValue::Get(parameter));
+	ClientConfig::GetConfig(context).hash_join_backend = backend;
+}
+
+void HashJoinBackendSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).hash_join_backend = HashJoinBackend::LINEAR;
+}
+
+Value HashJoinBackendSetting::GetSetting(const ClientContext &context) {
+	return Value(HashJoinBackendToString(ClientConfig::GetConfig(context).hash_join_backend));
+}
+
 } // namespace duckdb
