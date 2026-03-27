@@ -23,6 +23,11 @@
 #include "mbedtls_wrapper.hpp"
 #include "duckdb/common/path.hpp"
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wthread-safety-analysis"
+#endif
+
 namespace duckdb {
 using SHA256State = duckdb_mbedtls::MbedTlsWrapper::SHA256State;
 
@@ -801,3 +806,7 @@ BlockManager &SingleFileStorageManager::GetBlockManager() {
 }
 
 } // namespace duckdb
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

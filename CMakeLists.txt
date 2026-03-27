@@ -55,6 +55,9 @@ set(CMAKE_CXX_STANDARD "17" CACHE STRING "C++ standard to enforce")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Avoid std::basic_string_view instantiations with non-character types inside fmt on libc++.
+add_definitions(-DDUCKDB_FMT_DISABLE_STD_STRING_VIEW=1)
+
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_MACOSX_RPATH 1)
@@ -947,5 +950,3 @@ if(EXISTS ${CMAKE_CONFIG_TEMPLATE} AND EXISTS ${CMAKE_CONFIG_VERSION_TEMPLATE})
           "${PROJECT_BINARY_DIR}/DuckDBConfigVersion.cmake"
     DESTINATION "${INSTALL_CMAKE_DIR}")
 endif()
-
-

@@ -4,6 +4,11 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/assert.hpp"
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wthread-safety-analysis"
+#endif
+
 namespace duckdb {
 
 struct StorageLockInternals : enable_shared_from_this<StorageLockInternals> {
@@ -104,3 +109,7 @@ unique_ptr<StorageLockKey> StorageLock::TryUpgradeCheckpointLock(StorageLockKey 
 }
 
 } // namespace duckdb
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

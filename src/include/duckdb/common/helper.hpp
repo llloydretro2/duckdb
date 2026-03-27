@@ -61,9 +61,12 @@ struct TemplatedUniqueIf<DATA_TYPE[N]>
 template<class DATA_TYPE, class... ARGS>
 inline
 typename TemplatedUniqueIf<DATA_TYPE, true>::templated_unique_single_t
+#if defined(__clang__)
+__attribute__((no_thread_safety_analysis))
+#endif
 make_uniq(ARGS&&... args) // NOLINT: mimic std style
 {
-    return unique_ptr<DATA_TYPE, std::default_delete<DATA_TYPE>, true>(new DATA_TYPE(std::forward<ARGS>(args)...));
+	return unique_ptr<DATA_TYPE, std::default_delete<DATA_TYPE>, true>(new DATA_TYPE(std::forward<ARGS>(args)...));
 }
 
 template<class DATA_TYPE, class... ARGS>
@@ -77,9 +80,12 @@ make_shared_ptr(ARGS&&... args) // NOLINT: mimic std style
 template<class DATA_TYPE, class... ARGS>
 inline
 typename TemplatedUniqueIf<DATA_TYPE, false>::templated_unique_single_t
+#if defined(__clang__)
+__attribute__((no_thread_safety_analysis))
+#endif
 make_unsafe_uniq(ARGS&&... args) // NOLINT: mimic std style
 {
-    return unique_ptr<DATA_TYPE, std::default_delete<DATA_TYPE>, false>(new DATA_TYPE(std::forward<ARGS>(args)...));
+	return unique_ptr<DATA_TYPE, std::default_delete<DATA_TYPE>, false>(new DATA_TYPE(std::forward<ARGS>(args)...));
 }
 
 template<class DATA_TYPE>

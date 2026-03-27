@@ -19,6 +19,11 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/checkpoint/checkpoint_options.hpp"
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wthread-safety-analysis"
+#endif
+
 namespace duckdb {
 
 void DuckCleanupInfo::Cleanup() noexcept {
@@ -574,3 +579,7 @@ void DuckTransactionManager::PushAttach(Transaction &transaction_p, AttachedData
 }
 
 } // namespace duckdb
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif

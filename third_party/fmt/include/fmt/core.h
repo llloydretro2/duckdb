@@ -184,14 +184,26 @@
 #endif
 
 // libc++ supports string_view in pre-c++17.
-#if (FMT_HAS_INCLUDE(<string_view>) &&                       \
-     (__cplusplus > 201402L || defined(_LIBCPP_VERSION))) || \
-    (defined(_MSVC_LANG) && _MSVC_LANG > 201402L && _MSC_VER >= 1910)
-#  include <string_view>
-#  define FMT_USE_STRING_VIEW
-#elif FMT_HAS_INCLUDE("experimental/string_view") && __cplusplus >= 201402L
-#  include <experimental/string_view>
-#  define FMT_USE_EXPERIMENTAL_STRING_VIEW
+#if defined(DUCKDB_FMT_DISABLE_STD_STRING_VIEW)
+// leave both macros undefined
+#elif defined(FMT_USE_STRING_VIEW)
+#  if !FMT_USE_STRING_VIEW
+#    undef FMT_USE_STRING_VIEW
+#  endif
+#elif defined(FMT_USE_EXPERIMENTAL_STRING_VIEW)
+#  if !FMT_USE_EXPERIMENTAL_STRING_VIEW
+#    undef FMT_USE_EXPERIMENTAL_STRING_VIEW
+#  endif
+#else
+#  if (FMT_HAS_INCLUDE(<string_view>) &&                       \
+       (__cplusplus > 201402L || defined(_LIBCPP_VERSION))) || \
+      (defined(_MSVC_LANG) && _MSVC_LANG > 201402L && _MSC_VER >= 1910)
+#    include <string_view>
+#    define FMT_USE_STRING_VIEW 1
+#  elif FMT_HAS_INCLUDE("experimental/string_view") && __cplusplus >= 201402L
+#    include <experimental/string_view>
+#    define FMT_USE_EXPERIMENTAL_STRING_VIEW 1
+#  endif
 #endif
 
 FMT_BEGIN_NAMESPACE
