@@ -113,6 +113,12 @@ struct ClientConfig {
 
 	//! Hash join backend selection (linear probing vs. cuckoo prototype, etc.)
 	HashJoinBackend hash_join_backend = HashJoinBackend::LINEAR;
+	//! Target load factor for the cuckoo hash join backend.
+	double hash_join_cuckoo_load_factor = 0.5;
+	//! Controls how aggressively the stash grows relative to the table capacity (capacity / scale).
+	idx_t hash_join_cuckoo_stash_scale = 64;
+	//! Minimum stash size regardless of capacity.
+	idx_t hash_join_cuckoo_min_stash = 64;
 
 public:
 	static ClientConfig &GetConfig(ClientContext &context);

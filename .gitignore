@@ -357,3 +357,15 @@ extension_external
 
 test/sql/pragma/output.json
 tools/pythonpkg/duckdb_build/
+
+#==============================================================================#
+# Local benchmark / test data artifacts
+#==============================================================================#
+bench_hash_backend.duckdb
+data/job.duckdb
+data/job/**
+data/tpch_sf1.duckdb
+job_perf/**
+job_query_benchmark/**
+job_query_profiles/**
+synthetic_perf/**

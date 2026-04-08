@@ -9,14 +9,14 @@ if [[ ! -x "${DUCKDB_BIN}" ]]; then
   exit 1
 fi
 
-SCRATCH_DIR=$(mktemp -d -t cuckoo-join-phase2-XXXXXX)
+SCRATCH_DIR=$(mktemp -d -t cuckoo-join-phase3-XXXXXX)
 cleanup() {
   rm -rf "${SCRATCH_DIR}"
 }
 trap cleanup EXIT
 
 if [[ -z "${DB_PATH}" ]]; then
-  DB_PATH="${SCRATCH_DIR}/cuckoo_phase2.duckdb"
+  DB_PATH="${SCRATCH_DIR}/cuckoo_phase3.duckdb"
 fi
 
 scalar_query() {
@@ -63,82 +63,80 @@ SQL
   rm -f "${err_file}"
 }
 
-echo "[Phase2/Bash] Ensuring baseline backend is LINEAR"
+echo "[Phase3/Bash] Ensuring baseline backend is LINEAR"
 default_backend=$(scalar_query "SET hash_join_backend='linear';" "SELECT current_setting('hash_join_backend');")
 if [[ "${default_backend}" != "LINEAR" ]]; then
   echo "error: expected default backend to be LINEAR, got '${default_backend}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] Verifying linear backend executes joins correctly"
+echo "[Phase3/Bash] Verifying linear backend executes joins correctly"
 result=$(scalar_query "SET hash_join_backend='linear';" "SELECT COUNT(*) FROM (VALUES (1),(2)) t1(i) JOIN (VALUES (1),(3)) t2(i) USING(i);")
 if [[ "${result}" != "1" ]]; then
   echo "error: expected linear backend join count 1, got '${result}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] Checking duckdb_settings() reflects LINEAR backend"
+echo "[Phase3/Bash] Checking duckdb_settings() reflects LINEAR backend"
 settings_value=$(scalar_query "SET hash_join_backend='linear';" "SELECT value FROM duckdb_settings() WHERE name='hash_join_backend';")
 if [[ "${settings_value}" != "LINEAR" ]]; then
   echo "error: duckdb_settings() reported '${settings_value}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] Linear backend handles duplicate keys"
+echo "[Phase3/Bash] Linear backend handles duplicate keys"
 linear_multiset=$(scalar_query "SET hash_join_backend='linear';" "SELECT list_sort(list(i)) FROM (SELECT i FROM (VALUES (1),(1),(2)) a(i) JOIN (VALUES (1),(1),(2)) b(i) USING(i)) t;")
 if [[ "$(echo "${linear_multiset}" | tr -d ' \"')" != "[1,1,1,1,2]" ]]; then
   echo "error: duplicate handling unexpected result '${linear_multiset}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] Rejecting unknown backend option"
+echo "[Phase3/Bash] Rejecting unknown backend option"
 sql_expect_error "SET hash_join_backend='unknown_backend';" "Invalid hash_join_backend value"
 
-echo "[Phase2/Bash] Switching to cuckoo backend"
+echo "[Phase3/Bash] Switching to cuckoo backend"
 cuckoo_backend=$(scalar_query "SET hash_join_backend='cuckoo';" "SELECT current_setting('hash_join_backend');")
 if [[ "${cuckoo_backend}" != "CUCKOO" ]]; then
   echo "error: failed to switch to cuckoo backend, got '${cuckoo_backend}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] Exercising cuckoo backend join"
-join_sql="SELECT COUNT(*) FROM (VALUES (1),(2)) a(i) JOIN (VALUES (1),(2)) b(i) USING(i)"
-join_output_file=$(mktemp "${SCRATCH_DIR}/join-XXXXXX")
-join_error_file=$(mktemp "${SCRATCH_DIR}/join-err-XXXXXX")
-set +e
-"${DUCKDB_BIN}" "${DB_PATH}" <<SQL >/dev/null 2>"${join_error_file}"
-SET hash_join_backend='cuckoo';
-COPY (
-${join_sql}
-) TO '${join_output_file}' (FORMAT CSV, HEADER FALSE);
-SQL
-join_status=$?
-set -e
-if [[ ${join_status} -eq 0 ]]; then
-  join_count=$(tr -d '\r' <"${join_output_file}" | tail -n 1)
-  if [[ "${join_count}" != "2" ]]; then
-    echo "error: cuckoo backend join returned unexpected count '${join_count}'" >&2
-    exit 1
-  fi
-  echo "[Phase2/Bash] Cuckoo backend join succeeded with count=${join_count}"
-else
-  if ! grep -qi "not implemented" "${join_error_file}"; then
-    echo "error: cuckoo backend join failed with unexpected error:" >&2
-    cat "${join_error_file}" >&2
-    exit 1
-  fi
-  echo "[Phase2/Bash] Cuckoo backend join not yet implemented (expected during early phases)"
+echo "[Phase3/Bash] duckdb_settings() reflects CUCKOO backend"
+cuckoo_settings=$(scalar_query "SET hash_join_backend='cuckoo';" "SELECT value FROM duckdb_settings() WHERE name='hash_join_backend';")
+if [[ "${cuckoo_settings}" != "CUCKOO" ]]; then
+  echo "error: duckdb_settings() reported '${cuckoo_settings}' instead of CUCKOO" >&2
+  exit 1
 fi
-rm -f "${join_output_file}" "${join_error_file}"
 
-echo "[Phase2/Bash] Resetting backend to LINEAR"
+echo "[Phase3/Bash] Exercising cuckoo backend join"
+join_count=$(scalar_query "SET hash_join_backend='cuckoo';" "SELECT COUNT(*) FROM (VALUES (1),(2)) a(i) JOIN (VALUES (1),(2)) b(i) USING(i);")
+if [[ "${join_count}" != "2" ]]; then
+  echo "error: cuckoo backend join returned unexpected count '${join_count}'" >&2
+  exit 1
+fi
+
+echo "[Phase3/Bash] Cuckoo backend handles duplicate keys"
+cuckoo_multiset=$(scalar_query "SET hash_join_backend='cuckoo';" "SELECT list_sort(list(i)) FROM (SELECT i FROM (VALUES (1),(1),(2)) a(i) JOIN (VALUES (1),(1),(2)) b(i) USING(i)) t;")
+if [[ "$(echo "${cuckoo_multiset}" | tr -d ' \"')" != "[1,1,1,1,2]" ]]; then
+  echo "error: cuckoo duplicate handling unexpected result '${cuckoo_multiset}'" >&2
+  exit 1
+fi
+
+echo "[Phase3/Bash] Cuckoo backend yields zero matches when expected"
+zero_count=$(scalar_query "SET hash_join_backend='cuckoo';" "SELECT COUNT(*) FROM (VALUES (1),(2)) a(i) JOIN (VALUES (3),(4)) b(i) USING(i);")
+if [[ "${zero_count}" != "0" ]]; then
+  echo "error: expected zero matches for disjoint inputs, got '${zero_count}'" >&2
+  exit 1
+fi
+
+echo "[Phase3/Bash] Resetting backend to LINEAR"
 scalar_query "SET hash_join_backend='linear';" "SELECT 1;" >/dev/null
 
-echo "[Phase2/Bash] duckdb_settings() row matches after reset"
+echo "[Phase3/Bash] duckdb_settings() row matches after reset"
 reset_value=$(scalar_query "SELECT 1;" "SELECT value FROM duckdb_settings() WHERE name='hash_join_backend';")
 if [[ "${reset_value}" != "LINEAR" ]]; then
   echo "error: expected LINEAR after reset but saw '${reset_value}'" >&2
   exit 1
 fi
 
-echo "[Phase2/Bash] All checks passed"
+echo "[Phase3/Bash] All checks passed"

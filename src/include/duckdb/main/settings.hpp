@@ -703,6 +703,34 @@ struct HashJoinBackendSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct HashJoinCuckooLoadFactorSetting {
+	using RETURN_TYPE = double;
+	static constexpr const char *Name = "hash_join_cuckoo_load_factor";
+	static constexpr const char *Description =
+	    "Target load factor for the cuckoo hash join backend (0.1 - 0.95).";
+	static constexpr const char *InputType = "DOUBLE";
+	static constexpr const char *DefaultValue = "0.5";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct HashJoinCuckooStashScaleSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "hash_join_cuckoo_stash_scale";
+	static constexpr const char *Description =
+	    "Controls the stash size for the cuckoo hash join backend (effective stash >= max(min_stash, capacity / scale)).";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "64";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct EnableExternalAccessSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_external_access";

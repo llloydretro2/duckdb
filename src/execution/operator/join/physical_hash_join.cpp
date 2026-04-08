@@ -6,6 +6,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/uhugeint.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
@@ -288,8 +289,10 @@ public:
 	      num_threads(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads())),
 	      temporary_memory_state(TemporaryMemoryManager::Get(context).Register(context)),
 	      initial_radix_bits(num_threads < 100 ? 4 : 5), finalized(false), active_local_states(0), total_size(0),
-	      max_partition_size(0), max_partition_count(0), probe_side_requirement(0), scanned_data(false) {
-		hash_table = op.InitializeHashTable(context, initial_radix_bits);
+	      max_partition_size(0), max_partition_count(0), probe_side_requirement(0), scanned_data(false),
+	      has_cuckoo_stats(false), published_cuckoo_stats(false) {
+		hash_backend = ClientConfig::GetConfig(context).hash_join_backend;
+		hash_table = op.InitializeHashTable(context, initial_radix_bits, hash_backend);
 
 		// For perfect hash join
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
@@ -338,6 +341,8 @@ public:
 	unique_ptr<JoinHashTable> hash_table;
 	//! The perfect hash join executor (if any)
 	unique_ptr<PerfectHashJoinExecutor> perfect_join_executor;
+	//! Backend used for building hash tables
+	HashJoinBackend hash_backend;
 	//! Whether or not the hash table has been finalized
 	bool finalized;
 	//! The number of active local states
@@ -359,6 +364,11 @@ public:
 
 	//! Whether or not we have started scanning data using GetData
 	atomic<bool> scanned_data;
+
+	//! Runtime stats for the cuckoo backend (if enabled)
+	bool has_cuckoo_stats;
+	atomic<bool> published_cuckoo_stats;
+	CuckooRuntimeStats cuckoo_stats;
 
 	bool skip_filter_pushdown = false;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
@@ -385,7 +395,7 @@ public:
 			payload_chunk.Initialize(allocator, op.payload_columns.col_types);
 		}
 
-		hash_table = op.InitializeHashTable(context, gstate.initial_radix_bits);
+		hash_table = op.InitializeHashTable(context, gstate.initial_radix_bits, gstate.hash_backend);
 		hash_table->GetSinkCollection().InitializeAppendState(append_state);
 
 		gstate.active_local_states++;
@@ -409,18 +419,45 @@ public:
 	unique_ptr<JoinFilterLocalState> local_filter_state;
 };
 
-unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context,
-                                                                const idx_t initial_radix_bits) const {
-	auto backend = ClientConfig::GetConfig(context).hash_join_backend;
-	if (backend == HashJoinBackend::CUCKOO) {
-		throw NotImplementedException(
-		    "hash_join_backend=CUCKOO is not implemented yet. Please switch back to LINEAR until the "
-		    "cuckoo hash table backend is available.");
+static void CaptureCuckooRuntimeStats(HashJoinGlobalSinkState &sink) {
+	if (!sink.hash_table) {
+		sink.has_cuckoo_stats = false;
+		sink.published_cuckoo_stats.store(false);
+		return;
 	}
+	CuckooRuntimeStats stats;
+	if (sink.hash_table->TryGetCuckooStats(stats)) {
+		sink.cuckoo_stats = stats;
+		sink.has_cuckoo_stats = true;
+		sink.published_cuckoo_stats.store(false);
+	} else {
+		sink.has_cuckoo_stats = false;
+		sink.published_cuckoo_stats.store(false);
+	}
+}
+
+static void PublishCuckooRuntimeStats(ExecutionContext &context, HashJoinGlobalSinkState &sink,
+                                      const PhysicalHashJoin &op) {
+	if (!sink.has_cuckoo_stats) {
+		return;
+	}
+	if (sink.published_cuckoo_stats.exchange(true)) {
+		return;
+	}
+	auto &query_profiler = QueryProfiler::Get(context.client);
+	if (!query_profiler.IsEnabled()) {
+		return;
+	}
+	auto &op_info = context.thread.profiler.GetOperatorInfo(op);
+	op_info.extra_info = op.ParamsToString();
+}
+
+unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context, const idx_t initial_radix_bits,
+                                                                HashJoinBackend backend) const {
 	auto result =
 	    make_uniq<JoinHashTable>(context, *this, conditions, payload_columns.col_types, join_type, initial_radix_bits,
 	                             rhs_output_columns.col_idxs, residual_info ? residual_info->Copy() : nullptr,
-	                             predicate ? predicate.get() : nullptr, lhs_output_in_probe);
+	                             predicate ? predicate.get() : nullptr, lhs_output_in_probe, backend);
 
 	if (!delim_types.empty() && join_type == JoinType::MARK) {
 		// correlated MARK join
@@ -760,6 +797,7 @@ public:
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 		sink.hash_table->finalized = true;
+		CaptureCuckooRuntimeStats(sink);
 	}
 
 	static constexpr idx_t CHUNKS_PER_TASK = 64;
@@ -1216,6 +1254,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 			sink.ScheduleFinalize(pipeline, event);
 		}
 		sink.finalized = true;
+		CaptureCuckooRuntimeStats(sink);
 		return SinkFinalizeType::READY;
 	}
 
@@ -1260,6 +1299,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 		sink.ScheduleFinalize(pipeline, event);
 	}
 	sink.finalized = true;
+	CaptureCuckooRuntimeStats(sink);
 	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty()) {
 		return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
 	}
@@ -1328,6 +1368,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
 	D_ASSERT(sink.finalized);
 	D_ASSERT(!sink.scanned_data);
+	PublishCuckooRuntimeStats(context, sink, *this);
 
 	if (sink.hash_table->Count() == 0) {
 		if (EmptyResultIfRHSIsEmpty()) {
@@ -1868,6 +1909,15 @@ ProgressData PhysicalHashJoin::GetProgress(ClientContext &context, GlobalSourceS
 	return res;
 }
 
+static string BackendToString(HashJoinBackend backend) {
+	switch (backend) {
+	case HashJoinBackend::CUCKOO:
+		return "CUCKOO";
+	default:
+		return "LINEAR";
+	}
+}
+
 InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Join Type"] = EnumUtil::ToString(join_type);
@@ -1891,6 +1941,40 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 	}
 
 	result["Conditions"] = condition_info;
+
+	string backend_label = "LINEAR";
+	bool include_cuckoo_stats = false;
+	if (sink_state) {
+		auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
+		backend_label = BackendToString(sink.hash_backend);
+		include_cuckoo_stats = sink.hash_backend == HashJoinBackend::CUCKOO && sink.has_cuckoo_stats;
+		if (include_cuckoo_stats) {
+			result["Cuckoo Load Factor"] =
+			    StringUtil::Format("%.2f%%", sink.cuckoo_stats.load_factor * 100.0);
+			result["Cuckoo Target Load Factor"] =
+			    StringUtil::Format("%.2f%%", sink.cuckoo_stats.target_load_factor * 100.0);
+			result["Cuckoo Capacity"] = to_string(sink.cuckoo_stats.capacity);
+			result["Cuckoo Entries"] = to_string(sink.cuckoo_stats.entries);
+			result["Cuckoo Stash Entries"] = to_string(sink.cuckoo_stats.stash_entries);
+			result["Cuckoo Stash High Watermark"] = to_string(sink.cuckoo_stats.stash_high_watermark);
+			result["Cuckoo Stash Limit"] = to_string(sink.cuckoo_stats.stash_limit);
+			result["Cuckoo Kickouts"] = to_string(sink.cuckoo_stats.kickouts);
+			result["Cuckoo Kickout Limit"] = to_string(sink.cuckoo_stats.kickout_limit);
+			result["Cuckoo Overflow Entries"] = to_string(sink.cuckoo_stats.overflow_entries);
+			result["Cuckoo Overflow High Watermark"] = to_string(sink.cuckoo_stats.overflow_high_watermark);
+			result["Cuckoo Rehashes"] = to_string(sink.cuckoo_stats.rehashes);
+			result["Cuckoo Hash Functions"] = to_string(sink.cuckoo_stats.hash_function_count);
+			result["Cuckoo Fallback Events"] = to_string(sink.cuckoo_stats.fallback_events);
+			if (sink.cuckoo_stats.fallback_reason_mask != CUCKOO_FALLBACK_NONE) {
+				result["Cuckoo Fallback Reason"] =
+				    CuckooFallbackReasonToString(sink.cuckoo_stats.fallback_reason_mask);
+			}
+			if (sink.cuckoo_stats.backend_disabled) {
+				result["Cuckoo Backend Disabled"] = "YES";
+			}
+		}
+	}
+	result["Hash Join Backend"] = backend_label;
 
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;

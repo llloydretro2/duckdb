@@ -10,26 +10,91 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/string_util.hpp"
+#include <array>
+#include <string>
 #include <vector>
 
 namespace duckdb {
 
 class ClientContext;
 
+enum CuckooFallbackReasonMask : uint8_t {
+	CUCKOO_FALLBACK_NONE = 0,
+	CUCKOO_FALLBACK_KICKOUT = 1 << 0,
+	CUCKOO_FALLBACK_STASH = 1 << 1,
+	CUCKOO_FALLBACK_REHASH = 1 << 2
+};
+
+struct CuckooTableConfig {
+	double target_load_factor = 0.5;
+	idx_t stash_scale = 64;
+	idx_t min_stash = 64;
+};
+
 //! Lightweight cuckoo hash table used by the experimental hash join backend.
+struct CuckooRuntimeStats {
+	double load_factor = 0;
+	idx_t capacity = 0;
+	idx_t entries = 0;
+	double target_load_factor = 0;
+	idx_t stash_entries = 0;
+	idx_t stash_high_watermark = 0;
+	idx_t overflow_entries = 0;
+	idx_t overflow_high_watermark = 0;
+	idx_t kickouts = 0;
+	idx_t rehashes = 0;
+	idx_t fallback_events = 0;
+	idx_t stash_limit = 0;
+	idx_t kickout_limit = 0;
+	idx_t hash_function_count = 0;
+	uint8_t fallback_reason_mask = 0;
+	bool backend_disabled = false;
+};
+
+inline string CuckooFallbackReasonToString(uint8_t mask) {
+	if (mask == CUCKOO_FALLBACK_NONE) {
+		return "none";
+	}
+	vector<string> reasons;
+	if (mask & CUCKOO_FALLBACK_KICKOUT) {
+		reasons.emplace_back("kickout_threshold");
+	}
+	if (mask & CUCKOO_FALLBACK_STASH) {
+		reasons.emplace_back("stash_pressure");
+	}
+	if (mask & CUCKOO_FALLBACK_REHASH) {
+		reasons.emplace_back("rehash_limit");
+	}
+	return StringUtil::Join(reasons, ",");
+}
+
 class CuckooJoinHashTable {
 public:
-	explicit CuckooJoinHashTable(idx_t initial_capacity = 0);
+	explicit CuckooJoinHashTable(const CuckooTableConfig &config = CuckooTableConfig{}, idx_t initial_capacity = 0);
+	static constexpr idx_t MAX_LOOKUP_CANDIDATES = 512;
+	static constexpr idx_t NUM_HASH_FUNCTIONS = 3;
+	static constexpr idx_t BUCKET_SLOT_COUNT = 4;
 
 	//! Resets all buckets/stash entries.
 	void Reset();
+
+	//! Apply a new configuration (load factor, stash scaling, etc.)
+	void Configure(const CuckooTableConfig &config);
 
 	//! Ensure the table can hold at least `count` entries without rehashing.
 	void Reserve(idx_t count);
 
 	//! Insert a row pointer identified by the already-computed hash.
 	//! Returns true on success, false if the table/stash overflowed even after a rehash.
-	bool Insert(hash_t hash, data_ptr_t row_ptr);
+	bool Insert(hash_t hash, idx_t entry_index);
+
+	//! Lookup returns up to max_results row pointers matching the hash
+	idx_t Lookup(hash_t hash, idx_t *results, idx_t max_results) const;
+
+	double LoadFactor() const;
+	CuckooRuntimeStats GetStats() const;
 
 	//! Number of stored entries (buckets + stash).
 	idx_t Size() const {
@@ -55,35 +120,65 @@ public:
 private:
 	struct Bucket {
 		hash_t hash;
-		data_ptr_t row_ptr;
+		idx_t entry_index;
 	};
 
 private:
 	std::vector<Bucket> buckets;
 	std::vector<Bucket> stash;
+	unordered_map<hash_t, std::vector<idx_t>> overflow_map;
 
 	idx_t capacity;
 	idx_t mask;
 	idx_t size;
 
-	const idx_t kickout_limit = 32;
-	const idx_t stash_limit = 64;
+	double configured_load_factor = 0.5;
+	idx_t configured_stash_scale = 64;
+	idx_t configured_min_stash = 64;
+
+	idx_t kickout_limit = 32;
+	idx_t stash_limit = 64;
 	double max_load_factor = 0.9;
+	idx_t stash_scale = 64;
 
 	idx_t total_kickouts = 0;
 	idx_t rehash_count = 0;
+	idx_t stash_high_watermark = 0;
+	idx_t overflow_entries = 0;
+	idx_t overflow_high_watermark = 0;
+	idx_t cumulative_overflow_entries = 0;
+	idx_t cumulative_stash_high_watermark = 0;
+	idx_t max_rehash_attempts = 3;
+	mutable uint8_t fallback_reason_mask = 0;
+	mutable unordered_map<hash_t, idx_t> hot_entries;
+	unordered_map<hash_t, idx_t> stash_frequencies;
+	unordered_map<hash_t, idx_t> collision_counts;
+	idx_t duplicate_updates = 0;
+	idx_t total_insert_attempts = 0;
+	double observed_duplicate_ratio = 0.0;
+	static constexpr idx_t HOT_KEY_THRESHOLD = 8;
+	static constexpr idx_t HOT_COLLISION_THRESHOLD = 4;
 
 private:
 	void Grow(idx_t new_capacity);
-	bool InsertOrRehash(hash_t hash, data_ptr_t row_ptr, bool allow_rehash);
-	bool TryPlace(idx_t slot, hash_t hash, data_ptr_t row_ptr);
-	bool Kickout(idx_t slot, hash_t hash, data_ptr_t row_ptr);
-	void PushToStash(hash_t hash, data_ptr_t row_ptr);
+	void UpdateAdaptiveLimits();
+	bool ShouldExpand() const;
+	bool ShouldForceFallback();
+	bool PromoteHotKey(hash_t hash, idx_t entry_index);
+	void RecordDuplicate();
+	enum class PlaceStatus : uint8_t { PLACED, DUPLICATE, FULL };
+	PlaceStatus InsertOrRehash(hash_t hash, idx_t entry_index, bool allow_rehash);
+	PlaceStatus TryPlace(idx_t slot, hash_t hash, idx_t entry_index);
+	PlaceStatus Kickout(idx_t slot, idx_t function_index, hash_t hash, idx_t entry_index);
+	PlaceStatus PushToStash(hash_t hash, idx_t entry_index);
 	void Rehash(idx_t new_capacity);
 
-	idx_t PrimarySlot(hash_t hash) const;
-	idx_t SecondarySlot(hash_t hash) const;
-	idx_t AlternateSlot(hash_t hash, idx_t current_slot) const;
+	idx_t HashSlot(hash_t hash, idx_t function_index) const;
+	idx_t FindFunctionIndex(hash_t hash, idx_t slot) const;
+	double AdaptiveLoadFactor(idx_t count) const;
+	idx_t AdaptiveStashScale(idx_t current_capacity) const;
+	void PushToOverflow(hash_t hash, idx_t entry_index);
+	void ResetCollisionCounter(hash_t hash);
 };
 
 } // namespace duckdb

@@ -120,6 +120,8 @@ static const ConfigurationOption internal_options[] = {
 	DUCKDB_SETTING_CALLBACK(DuckDBAPISetting),
 	DUCKDB_SETTING(DynamicOrFilterThresholdSetting),
 	DUCKDB_LOCAL(HashJoinBackendSetting),
+	DUCKDB_LOCAL(HashJoinCuckooLoadFactorSetting),
+	DUCKDB_LOCAL(HashJoinCuckooStashScaleSetting),
 	DUCKDB_SETTING_CALLBACK(EnableExternalAccessSetting),
     DUCKDB_SETTING_CALLBACK(EnableExternalFileCacheSetting),
     DUCKDB_SETTING(EnableFSSTVectorsSetting),

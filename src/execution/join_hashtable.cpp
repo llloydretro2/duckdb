@@ -4,13 +4,17 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include <array>
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/types/hyperloglog.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include <cmath>
 
 namespace duckdb {
 
@@ -33,17 +37,20 @@ JoinHashTable::InsertState::InsertState(const JoinHashTable &ht)
       rhs_row_locations(LogicalType::POINTER) {
 	ht.data_collection->InitializeChunk(lhs_data, ht.equality_predicate_columns);
 	ht.data_collection->InitializeChunkState(chunk_state, ht.equality_predicate_columns);
+	if (ht.UseCuckooTable()) {
+		cuckoo_hashes = make_unsafe_uniq_array_uninitialized<hash_t>(STANDARD_VECTOR_SIZE);
+	}
 }
 
 JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &op_p,
                              const vector<JoinCondition> &conditions_p, vector<LogicalType> btypes, JoinType type_p,
                              const idx_t initial_radix_bits, const vector<idx_t> &output_columns_p,
                              unique_ptr<ResidualPredicateInfo> residual_p, optional_ptr<Expression> predicate_ptr,
-                             const vector<idx_t> &output_in_probe)
+                             const vector<idx_t> &output_in_probe, HashJoinBackend backend_p)
     : context(context_p), op(op_p), buffer_manager(BufferManager::GetBufferManager(context)), conditions(conditions_p),
       build_types(std::move(btypes)), output_columns(output_columns_p), entry_size(0), tuple_size(0),
       vfound(Value::BOOLEAN(false)), join_type(type_p), finalized(false), has_null(false),
-      residual_predicate(predicate_ptr), radix_bits(initial_radix_bits) {
+      residual_predicate(predicate_ptr), radix_bits(initial_radix_bits), backend(backend_p) {
 	// store residual predicate information
 	residual_info = std::move(residual_p);
 	lhs_output_in_probe = output_in_probe;
@@ -128,6 +135,16 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
 	}
 
 	InitializePartitionMasks();
+
+	if (backend == HashJoinBackend::CUCKOO) {
+		auto &client_config = ClientConfig::GetConfig(context);
+		CuckooTableConfig cuckoo_config;
+		cuckoo_config.target_load_factor = client_config.hash_join_cuckoo_load_factor;
+		cuckoo_config.stash_scale = client_config.hash_join_cuckoo_stash_scale;
+		cuckoo_config.min_stash = client_config.hash_join_cuckoo_min_stash;
+		cuckoo_base_config = cuckoo_config;
+		cuckoo_table = make_uniq<CuckooJoinHashTable>(cuckoo_base_config);
+	}
 }
 
 JoinHashTable::~JoinHashTable() {
@@ -343,6 +360,10 @@ inline bool JoinHashTable::UseSalt() const {
 void JoinHashTable::GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
                                    const SelectionVector *sel, idx_t &count, Vector &pointers_result_v,
                                    SelectionVector &match_sel, const bool has_sel) {
+	if (UseCuckooTable()) {
+		GetRowPointersCuckoo(keys, key_state, state, hashes_v, sel, count, pointers_result_v, match_sel, has_sel);
+		return;
+	}
 	if (UseSalt()) {
 		GetRowPointersInternal<true>(keys, key_state, state, hashes_v, sel, count, *this, entries, pointers_result_v,
 		                             match_sel, has_sel);
@@ -350,6 +371,78 @@ void JoinHashTable::GetRowPointers(DataChunk &keys, TupleDataChunkState &key_sta
 		GetRowPointersInternal<false>(keys, key_state, state, hashes_v, sel, count, *this, entries, pointers_result_v,
 		                              match_sel, has_sel);
 	}
+}
+
+void JoinHashTable::GetRowPointersCuckoo(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state,
+                                         Vector &hashes_v, const SelectionVector *row_sel, idx_t &count,
+                                         Vector &pointers_result_v, SelectionVector &match_sel,
+                                         bool has_row_sel) {
+	D_ASSERT(UseCuckooTable());
+	pointers_result_v.SetVectorType(VectorType::FLAT_VECTOR);
+	auto pointer_data = FlatVector::GetData<data_ptr_t>(pointers_result_v);
+
+	if (has_row_sel) {
+		UnifiedVectorFormat hashes_unified_v;
+		hashes_v.ToUnifiedFormat(count, hashes_unified_v);
+		auto hashes_unified = UnifiedVectorFormat::GetData<hash_t>(hashes_unified_v);
+		auto hashes_dense = FlatVector::GetData<hash_t>(state.hashes_dense_v);
+		for (idx_t i = 0; i < count; i++) {
+			const auto row_index = row_sel->get_index(i);
+			const auto uvf_index = hashes_unified_v.sel->get_index(row_index);
+			hashes_dense[i] = hashes_unified[uvf_index];
+		}
+	} else {
+		VectorOperations::Copy(hashes_v, state.hashes_dense_v, count, 0, 0);
+	}
+
+	auto hashes_dense = FlatVector::GetData<hash_t>(state.hashes_dense_v);
+	idx_t candidate_count = 0;
+	idx_t match_count = 0;
+	const SelectionVector *current_sel = has_row_sel ? row_sel : FlatVector::IncrementalSelectionVector();
+
+	auto flush_candidates = [&](void) {
+		if (candidate_count == 0) {
+			return;
+		}
+		idx_t keys_no_match_count = 0;
+		const idx_t keys_match_count = row_matcher_build.Match(
+		    keys, key_state.vector_data, state.keys_to_compare_sel, candidate_count, pointers_result_v,
+		    &state.keys_no_match_sel, keys_no_match_count);
+		for (idx_t i = 0; i < keys_match_count; i++) {
+			const auto row_index = state.keys_to_compare_sel.get_index(i);
+			match_sel.set_index(match_count++, row_index);
+		}
+		candidate_count = 0;
+	};
+
+	std::array<idx_t, CuckooJoinHashTable::MAX_LOOKUP_CANDIDATES> local_candidates {};
+	for (idx_t i = 0; i < count; i++) {
+		const auto row_index = current_sel->get_index(i);
+		const auto hash = hashes_dense[i];
+		auto table = GetCuckooTableForHash(hash);
+		if (!table) {
+			continue;
+		}
+		const auto candidate_total = table->Lookup(hash, local_candidates.data(), local_candidates.size());
+		if (candidate_total == 0) {
+			continue;
+		}
+		for (idx_t c = 0; c < candidate_total; c++) {
+			const auto entry_index = local_candidates[c];
+			const auto slot = entry_index & bitmask;
+			if (slot >= capacity) {
+				continue;
+			}
+			pointer_data[row_index] = entries[slot].GetPointer();
+			state.keys_to_compare_sel.set_index(candidate_count++, row_index);
+			if (candidate_count == STANDARD_VECTOR_SIZE) {
+				flush_candidates();
+			}
+		}
+	}
+
+	flush_candidates();
+	count = match_count;
 }
 
 void JoinHashTable::Hash(DataChunk &keys, const SelectionVector &sel, idx_t count, Vector &hashes) {
@@ -564,7 +657,7 @@ static inline void InsertMatchesAndIncrementMisses(atomic<ht_entry_t> entries[],
                                                    JoinHashTable &ht, const data_ptr_t lhs_row_locations[],
                                                    idx_t ht_offsets[], const hash_t hash_salts[],
                                                    const idx_t capacity_mask, const idx_t key_match_count,
-                                                   const idx_t key_no_match_count) {
+                                                   const idx_t key_no_match_count, hash_t *cuckoo_hashes) {
 	if (key_match_count != 0) {
 		ht.chains_longer_than_one = true;
 	}
@@ -601,6 +694,17 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
                              JoinHashTable::InsertState &state, const TupleDataCollection &data_collection,
                              JoinHashTable &ht) {
 	D_ASSERT(hashes_v.GetType().id() == LogicalType::HASH);
+	hash_t *cuckoo_hashes = nullptr;
+	if (ht.IsCuckooBackend()) {
+		cuckoo_hashes = state.cuckoo_hashes.get();
+		UnifiedVectorFormat original_hashes;
+		hashes_v.ToUnifiedFormat(count, original_hashes);
+		auto hashes_data = UnifiedVectorFormat::GetData<hash_t>(original_hashes);
+		for (idx_t i = 0; i < count; i++) {
+			const auto row_index = original_hashes.sel->get_index(i);
+			cuckoo_hashes[i] = hashes_data[row_index];
+		}
+	}
 	ApplyBitmaskAndGetSaltBuild(hashes_v, state.salt_v, count, ht.bitmask);
 
 	const auto &layout = data_collection.GetLayout();
@@ -680,25 +784,30 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
 				IncrementAndWrap(ht_offset, capacity_mask);
 			}
 
-			if (!occupied) { // insert into free
-				auto &atomic_entry = entries[ht_offset];
-				const auto row_ptr_to_insert = lhs_row_locations[row_index];
-				const auto potential_collided_ptr =
-				    InsertRowToEntry<PARALLEL, true>(atomic_entry, row_ptr_to_insert, salt, ht.pointer_offset);
+		if (!occupied) { // insert into free
+			auto &atomic_entry = entries[ht_offset];
+			const auto row_ptr_to_insert = lhs_row_locations[row_index];
+			const auto potential_collided_ptr =
+			    InsertRowToEntry<PARALLEL, true>(atomic_entry, row_ptr_to_insert, salt, ht.pointer_offset);
 
-				if (PARALLEL) {
-					// if the insertion was not successful, the entry was occupied in the meantime, so we have to
-					// compare the keys and insert the row to the next entry
-					if (DUCKDB_UNLIKELY(potential_collided_ptr != nullptr)) {
-						// if the entry was occupied, we need to compare the keys and insert the row to the next entry
-						// we need to compare the keys and insert the row to the next entry
-						state.keys_to_compare_sel.set_index(salt_match_count, row_index);
-						rhs_row_locations[salt_match_count] = potential_collided_ptr;
-						salt_match_count += 1;
-					}
+			if (PARALLEL) {
+				// if the insertion was not successful, the entry was occupied in the meantime, so we have to
+				// compare the keys and insert the row to the next entry
+				if (DUCKDB_UNLIKELY(potential_collided_ptr != nullptr)) {
+					state.keys_to_compare_sel.set_index(salt_match_count, row_index);
+					rhs_row_locations[salt_match_count] = potential_collided_ptr;
+					salt_match_count += 1;
 				}
+				if (DUCKDB_LIKELY(potential_collided_ptr == nullptr) && cuckoo_hashes) {
+					ht.AddCuckooEntry(cuckoo_hashes[row_index], ht_offset);
+				}
+			} else {
+				if (cuckoo_hashes) {
+					ht.AddCuckooEntry(cuckoo_hashes[row_index], ht_offset);
+				}
+			}
 
-			} else { // compare with full entry
+		} else { // compare with full entry
 				state.keys_to_compare_sel.set_index(salt_match_count, row_index);
 				rhs_row_locations[salt_match_count] = entry.GetPointer();
 				salt_match_count += 1;
@@ -713,7 +822,8 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
 			PerformKeyComparison(state, ht, data_collection, row_locations, salt_match_count, key_match_count,
 			                     key_no_match_count);
 			InsertMatchesAndIncrementMisses<PARALLEL>(entries, state, ht, lhs_row_locations, ht_offsets, hash_salts,
-			                                          capacity_mask, key_match_count, key_no_match_count);
+			                                          capacity_mask, key_match_count, key_no_match_count,
+			                                          cuckoo_hashes);
 		}
 
 		// update the overall selection vector to only point the entries that still need to be inserted
@@ -804,6 +914,11 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
                              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state) {
 	// Pointer table should be allocated
 	D_ASSERT(hash_map.get());
+
+	if (UseCuckooTable()) {
+		const auto distinct_estimate = EstimateCuckooDistinct(chunk_idx_from, chunk_idx_to);
+		PrepareCuckooCapacity(distinct_estimate);
+	}
 
 	Vector hashes(LogicalType::HASH);
 	auto hash_data = FlatVector::GetData<hash_t>(hashes);
@@ -1932,6 +2047,227 @@ void ProbeSpill::PrepareNextProbe() {
 	}
 	consumer = make_uniq<ColumnDataConsumer>(*global_spill_collection, column_ids);
 	consumer->InitializeScan();
+}
+
+idx_t JoinHashTable::EstimateCuckooDistinct(idx_t chunk_idx_from, idx_t chunk_idx_to) {
+	if (Count() == 0) {
+		return 0;
+	}
+	HyperLogLog hll;
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED,
+	                                chunk_idx_from, chunk_idx_to, false);
+	do {
+		auto count = iterator.GetCurrentChunkCount();
+		auto row_locations = iterator.GetRowLocations();
+		for (idx_t i = 0; i < count; i++) {
+			const auto hash_value = Load<hash_t>(row_locations[i] + pointer_offset);
+			hll.InsertElement(hash_value);
+		}
+	} while (iterator.Next());
+	auto approx = hll.Count();
+	if (approx == 0) {
+		approx = Count();
+	}
+	approx = MinValue<idx_t>(approx, Count());
+	return MaxValue<idx_t>(approx, idx_t(1));
+}
+
+void JoinHashTable::PrepareCuckooCapacity(idx_t distinct_estimate) {
+	if (backend != HashJoinBackend::CUCKOO) {
+		return;
+	}
+	lock_guard<mutex> guard(cuckoo_lock);
+	if (cuckoo_disabled.load()) {
+		return;
+	}
+	const idx_t total_entries = Count();
+	if (total_entries == 0) {
+		return;
+	}
+	const idx_t target = distinct_estimate == 0 ? total_entries : MinValue(distinct_estimate, total_entries);
+	idx_t desired_partitions = 1;
+	if (target >= CUCKOO_PARTITION_THRESHOLD) {
+		const idx_t partitions =
+		    MaxValue<idx_t>(idx_t(2), (target + CUCKOO_PARTITION_TARGET - 1) / CUCKOO_PARTITION_TARGET);
+		const idx_t max_partitions = idx_t(1) << CUCKOO_MAX_PARTITION_BITS;
+		desired_partitions = MinValue<idx_t>(NextPowerOfTwo(partitions), max_partitions);
+	}
+	if (desired_partitions <= 1) {
+		ResetToSingleCuckooTable();
+		if (cuckoo_table) {
+			cuckoo_table->Reserve(target);
+		}
+		return;
+	}
+	EnsureCuckooPartitions(desired_partitions);
+	const idx_t per_target = MaxValue<idx_t>(target / desired_partitions, idx_t(1));
+	for (auto &partition : cuckoo_partitions) {
+		partition->Reserve(per_target);
+	}
+}
+
+bool JoinHashTable::TryGetCuckooStats(CuckooRuntimeStats &out_stats) const {
+	if (backend != HashJoinBackend::CUCKOO) {
+		return false;
+	}
+	lock_guard<mutex> guard(cuckoo_lock);
+	if (!cuckoo_disabled.load()) {
+		if (!cuckoo_partitions.empty()) {
+			CuckooRuntimeStats aggregated;
+			bool has_stats = false;
+			for (auto &partition : cuckoo_partitions) {
+				if (!partition) {
+					continue;
+				}
+				auto stats = partition->GetStats();
+				aggregated.capacity += stats.capacity;
+				aggregated.entries += stats.entries;
+				aggregated.stash_entries += stats.stash_entries;
+				aggregated.stash_high_watermark =
+				    MaxValue<idx_t>(aggregated.stash_high_watermark, stats.stash_high_watermark);
+				aggregated.kickouts += stats.kickouts;
+				aggregated.rehashes += stats.rehashes;
+				aggregated.stash_limit = MaxValue<idx_t>(aggregated.stash_limit, stats.stash_limit);
+				aggregated.kickout_limit = MaxValue<idx_t>(aggregated.kickout_limit, stats.kickout_limit);
+				if (!has_stats) {
+					aggregated.target_load_factor = stats.target_load_factor;
+				}
+				has_stats = true;
+			}
+			if (has_stats) {
+				aggregated.load_factor =
+				    aggregated.capacity == 0 ? 0 : static_cast<double>(aggregated.entries) / aggregated.capacity;
+				aggregated.hash_function_count = CuckooJoinHashTable::NUM_HASH_FUNCTIONS;
+				aggregated.fallback_events = cuckoo_fallback_count;
+				aggregated.backend_disabled = false;
+				out_stats = aggregated;
+				return true;
+			}
+		} else if (cuckoo_table) {
+			out_stats = cuckoo_table->GetStats();
+			out_stats.fallback_events = cuckoo_fallback_count;
+			out_stats.backend_disabled = false;
+			return true;
+		}
+	}
+	if (cuckoo_fallback_stats_valid) {
+		out_stats = cuckoo_fallback_stats;
+		out_stats.fallback_events = cuckoo_fallback_count;
+		out_stats.backend_disabled = true;
+		return true;
+	}
+	return false;
+}
+
+void JoinHashTable::RegisterCuckooEntry(hash_t hash, idx_t entry_index) {
+	if (backend != HashJoinBackend::CUCKOO) {
+		return;
+	}
+	lock_guard<mutex> guard(cuckoo_lock);
+	if (cuckoo_disabled.load()) {
+		return;
+	}
+	entry_index &= bitmask;
+	bool success = false;
+	if (HasCuckooPartitions()) {
+		const auto partition_idx =
+		    MinValue<idx_t>(GetCuckooPartitionIndex(hash), cuckoo_partitions.empty() ? idx_t(0) : cuckoo_partitions.size() - 1);
+		success = InsertIntoCuckooPartition(partition_idx, hash, entry_index);
+	} else if (cuckoo_table) {
+		success = InsertIntoCuckooTable(*cuckoo_table, hash, entry_index);
+	}
+	if (success) {
+		return;
+	}
+	// fallback if we still fail after retries
+	auto *table = GetCuckooTableForHash(hash);
+	if (table) {
+		cuckoo_fallback_stats = table->GetStats();
+	}
+	cuckoo_fallback_stats.backend_disabled = true;
+	cuckoo_fallback_stats.fallback_events = ++cuckoo_fallback_count;
+	cuckoo_fallback_stats_valid = true;
+	cuckoo_table.reset();
+	cuckoo_partitions.clear();
+	cuckoo_partition_bits = 0;
+	cuckoo_partition_mask = 0;
+	cuckoo_disabled.store(true);
+	DUCKDB_LOG(context, PhysicalOperatorLogType, op, "JoinHashTable", "Cuckoo backend fallback",
+	           {{"fallbacks", to_string(cuckoo_fallback_count)},
+	            {"reason", CuckooFallbackReasonToString(cuckoo_fallback_stats.fallback_reason_mask)}});
+}
+
+idx_t JoinHashTable::GetCuckooPartitionIndex(hash_t hash) const {
+	if (cuckoo_partition_bits == 0) {
+		return 0;
+	}
+	const idx_t shift = 64 - cuckoo_partition_bits;
+	return (hash >> shift) & cuckoo_partition_mask;
+}
+
+CuckooJoinHashTable *JoinHashTable::GetCuckooTableForHash(hash_t hash) const {
+	if (!UseCuckooTable()) {
+		return nullptr;
+	}
+	if (!HasCuckooPartitions()) {
+		return cuckoo_table.get();
+	}
+	const auto idx = MinValue<idx_t>(GetCuckooPartitionIndex(hash), cuckoo_partitions.size() - 1);
+	return cuckoo_partitions[idx].get();
+}
+
+void JoinHashTable::ResetToSingleCuckooTable() {
+	cuckoo_partitions.clear();
+	cuckoo_partition_bits = 0;
+	cuckoo_partition_mask = 0;
+	if (!cuckoo_table) {
+		cuckoo_table = make_uniq<CuckooJoinHashTable>(cuckoo_base_config);
+	}
+}
+
+void JoinHashTable::EnsureCuckooPartitions(idx_t desired_partitions) {
+	if (desired_partitions <= 1) {
+		ResetToSingleCuckooTable();
+		return;
+	}
+	if (cuckoo_partitions.size() == desired_partitions) {
+		return;
+	}
+	cuckoo_table.reset();
+	cuckoo_partitions.clear();
+	cuckoo_partitions.reserve(desired_partitions);
+	for (idx_t i = 0; i < desired_partitions; i++) {
+		cuckoo_partitions.push_back(make_uniq<CuckooJoinHashTable>(cuckoo_base_config));
+	}
+	cuckoo_partition_bits = 0;
+	while ((idx_t(1) << cuckoo_partition_bits) < desired_partitions) {
+		cuckoo_partition_bits++;
+	}
+	cuckoo_partition_mask = desired_partitions - 1;
+}
+
+bool JoinHashTable::InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, idx_t entry_index) {
+	if (table.Insert(hash, entry_index)) {
+		return true;
+	}
+	idx_t new_capacity = table.Capacity() == 0 ? idx_t(8) : table.Capacity() * 2;
+	new_capacity = MaxValue<idx_t>(new_capacity, table.Size() * 2 + 8);
+	for (idx_t attempt = 0; attempt < 2; attempt++) {
+		table.Reserve(new_capacity);
+		if (table.Insert(hash, entry_index)) {
+			return true;
+		}
+		new_capacity = MaxValue<idx_t>(new_capacity * 2, table.Size() * 2 + 8);
+	}
+	return table.Insert(hash, entry_index);
+}
+
+bool JoinHashTable::InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, idx_t entry_index) {
+	if (!HasCuckooPartitions() || partition_idx >= cuckoo_partitions.size()) {
+		return false;
+	}
+	auto &table = *cuckoo_partitions[partition_idx];
+	return InsertIntoCuckooTable(table, hash, entry_index);
 }
 
 } // namespace duckdb

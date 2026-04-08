@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/enums/hash_join_backend.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types/column/column_data_consumer.hpp"
 #include "duckdb/common/types/column/partitioned_column_data.hpp"
@@ -18,9 +19,11 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/execution/aggregate_hashtable.hpp"
+#include "duckdb/execution/cuckoo_join_hashtable.hpp"
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/planner/filter/bloom_filter.hpp"
 #include "duckdb/planner/filter/prefix_range_filter.hpp"
+#include <atomic>
 
 namespace duckdb {
 
@@ -189,6 +192,7 @@ public:
 		// The ptrs to the row to which a key should be inserted into during building
 		// or matched against during probing
 		Vector rhs_row_locations;
+		unsafe_unique_array<hash_t> cuckoo_hashes;
 
 		DataChunk lhs_data;
 		TupleDataChunkState chunk_state;
@@ -197,7 +201,8 @@ public:
 	JoinHashTable(ClientContext &context, const PhysicalOperator &op, const vector<JoinCondition> &conditions,
 	              vector<LogicalType> build_types, JoinType type, idx_t initial_radix_bits,
 	              const vector<idx_t> &output_columns, unique_ptr<ResidualPredicateInfo> residual_p,
-	              optional_ptr<Expression> predicate_ptr = nullptr, const vector<idx_t> &output_in_probe = {});
+	              optional_ptr<Expression> predicate_ptr = nullptr, const vector<idx_t> &output_in_probe = {},
+	              HashJoinBackend backend = HashJoinBackend::LINEAR);
 	~JoinHashTable();
 
 	//! Add the given data to the HT
@@ -235,6 +240,17 @@ public:
 		return *sink_collection;
 	}
 
+	HashJoinBackend GetBackend() const {
+		return backend;
+	}
+
+	bool TryGetCuckooStats(CuckooRuntimeStats &out_stats) const;
+	bool IsCuckooBackend() const {
+		return UseCuckooTable();
+	}
+	void AddCuckooEntry(hash_t hash, idx_t entry_index) {
+		RegisterCuckooEntry(hash, entry_index);
+	}
 	TupleDataCollection &GetDataCollection() {
 		return *data_collection;
 	}
@@ -339,12 +355,33 @@ private:
 	void Hash(DataChunk &keys, const SelectionVector &sel, idx_t count, Vector &hashes);
 
 	bool UseSalt() const;
+	bool UseCuckooTable() const {
+		if (backend != HashJoinBackend::CUCKOO || cuckoo_disabled.load()) {
+			return false;
+		}
+		return (cuckoo_table != nullptr) || !cuckoo_partitions.empty();
+	}
+	void RegisterCuckooEntry(hash_t hash, idx_t entry_index);
+	void PrepareCuckooCapacity(idx_t distinct_estimate);
+	idx_t EstimateCuckooDistinct(idx_t chunk_idx_from, idx_t chunk_idx_to);
+	bool HasCuckooPartitions() const {
+		return !cuckoo_partitions.empty();
+	}
+	bool InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, idx_t entry_index);
+	bool InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, idx_t entry_index);
+	idx_t GetCuckooPartitionIndex(hash_t hash) const;
+	CuckooJoinHashTable *GetCuckooTableForHash(hash_t hash) const;
+	void EnsureCuckooPartitions(idx_t desired_partitions);
+	void ResetToSingleCuckooTable();
 
 	//! Gets a pointer to the entry in the HT for each of the hashes_v using linear probing. Will update the
 	//! key_match_sel vector and the count argument to the number and position of the matches
 	void GetRowPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                    const SelectionVector *sel, idx_t &count, Vector &pointers_result_v, SelectionVector &match_sel,
 	                    bool has_sel);
+	void GetRowPointersCuckoo(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
+	                         const SelectionVector *sel, idx_t &count, Vector &pointers_result_v,
+	                         SelectionVector &match_sel, bool has_sel);
 
 private:
 	//! Insert the given set of locations into the HT with the given set of hashes_v
@@ -375,6 +412,21 @@ private:
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
+
+	HashJoinBackend backend;
+	unique_ptr<CuckooJoinHashTable> cuckoo_table;
+	CuckooTableConfig cuckoo_base_config;
+	vector<unique_ptr<CuckooJoinHashTable>> cuckoo_partitions;
+	idx_t cuckoo_partition_bits = 0;
+	idx_t cuckoo_partition_mask = 0;
+	static constexpr idx_t CUCKOO_PARTITION_THRESHOLD = 200000;
+	static constexpr idx_t CUCKOO_PARTITION_TARGET = 100000;
+	static constexpr idx_t CUCKOO_MAX_PARTITION_BITS = 6;
+	mutable mutex cuckoo_lock;
+	atomic<bool> cuckoo_disabled {false};
+	idx_t cuckoo_fallback_count = 0;
+	bool cuckoo_fallback_stats_valid = false;
+	CuckooRuntimeStats cuckoo_fallback_stats;
 
 	//! Copying not allowed
 	JoinHashTable(const JoinHashTable &) = delete;

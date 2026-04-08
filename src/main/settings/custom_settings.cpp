@@ -15,6 +15,7 @@
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/operator/double_cast_operator.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -1734,6 +1735,43 @@ void HashJoinBackendSetting::ResetLocal(ClientContext &context) {
 
 Value HashJoinBackendSetting::GetSetting(const ClientContext &context) {
 	return Value(HashJoinBackendToString(ClientConfig::GetConfig(context).hash_join_backend));
+}
+
+void HashJoinCuckooLoadFactorSetting::SetLocal(ClientContext &context, const Value &parameter) {
+	const auto load_factor = parameter.GetValue<double>();
+	if (load_factor <= 0.1 || load_factor >= 0.95) {
+		throw InvalidInputException(
+		    "hash_join_cuckoo_load_factor must be between 0.1 and 0.95 (exclusive). Provided value: %f", load_factor);
+	}
+	ClientConfig::GetConfig(context).hash_join_cuckoo_load_factor = load_factor;
+}
+
+void HashJoinCuckooLoadFactorSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).hash_join_cuckoo_load_factor = 0.5;
+}
+
+Value HashJoinCuckooLoadFactorSetting::GetSetting(const ClientContext &context) {
+	return Value::DOUBLE(ClientConfig::GetConfig(context).hash_join_cuckoo_load_factor);
+}
+
+void HashJoinCuckooStashScaleSetting::SetLocal(ClientContext &context, const Value &parameter) {
+	auto scale = parameter.GetValue<uint64_t>();
+	if (scale == 0) {
+		throw InvalidInputException("hash_join_cuckoo_stash_scale must be greater than zero");
+	}
+	auto &config = ClientConfig::GetConfig(context);
+	config.hash_join_cuckoo_stash_scale = static_cast<idx_t>(scale);
+	config.hash_join_cuckoo_min_stash = MaxValue<idx_t>(idx_t(32), static_cast<idx_t>(scale));
+}
+
+void HashJoinCuckooStashScaleSetting::ResetLocal(ClientContext &context) {
+	auto &config = ClientConfig::GetConfig(context);
+	config.hash_join_cuckoo_stash_scale = 64;
+	config.hash_join_cuckoo_min_stash = 64;
+}
+
+Value HashJoinCuckooStashScaleSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(ClientConfig::GetConfig(context).hash_join_cuckoo_stash_scale);
 }
 
 } // namespace duckdb
