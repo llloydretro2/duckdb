@@ -1955,13 +1955,19 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 			    StringUtil::Format("%.2f%%", sink.cuckoo_stats.target_load_factor * 100.0);
 			result["Cuckoo Capacity"] = to_string(sink.cuckoo_stats.capacity);
 			result["Cuckoo Entries"] = to_string(sink.cuckoo_stats.entries);
+			result["Cuckoo Bucket Slots"] = to_string(sink.cuckoo_stats.bucket_slot_count);
+			result["Cuckoo Block Size"] = to_string(sink.cuckoo_stats.block_size);
 			result["Cuckoo Stash Entries"] = to_string(sink.cuckoo_stats.stash_entries);
 			result["Cuckoo Stash High Watermark"] = to_string(sink.cuckoo_stats.stash_high_watermark);
 			result["Cuckoo Stash Limit"] = to_string(sink.cuckoo_stats.stash_limit);
 			result["Cuckoo Kickouts"] = to_string(sink.cuckoo_stats.kickouts);
+			result["Cuckoo Max Kickout Depth"] = to_string(sink.cuckoo_stats.max_kickout_depth);
+			result["Cuckoo BFS Failures"] = to_string(sink.cuckoo_stats.bfs_failures);
 			result["Cuckoo Kickout Limit"] = to_string(sink.cuckoo_stats.kickout_limit);
 			result["Cuckoo Overflow Entries"] = to_string(sink.cuckoo_stats.overflow_entries);
 			result["Cuckoo Overflow High Watermark"] = to_string(sink.cuckoo_stats.overflow_high_watermark);
+			result["Cuckoo Victim Entries"] = to_string(sink.cuckoo_stats.victim_entries);
+			result["Cuckoo Victim High Watermark"] = to_string(sink.cuckoo_stats.victim_high_watermark);
 			result["Cuckoo Rehashes"] = to_string(sink.cuckoo_stats.rehashes);
 			result["Cuckoo Hash Functions"] = to_string(sink.cuckoo_stats.hash_function_count);
 			result["Cuckoo Fallback Events"] = to_string(sink.cuckoo_stats.fallback_events);
@@ -1971,6 +1977,9 @@ InsertionOrderPreservingMap<string> PhysicalHashJoin::ParamsToString() const {
 			}
 			if (sink.cuckoo_stats.backend_disabled) {
 				result["Cuckoo Backend Disabled"] = "YES";
+			}
+			if (sink.cuckoo_stats.victim_mode) {
+				result["Cuckoo Victim Mode"] = "YES";
 			}
 		}
 	}

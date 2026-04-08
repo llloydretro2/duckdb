@@ -248,8 +248,8 @@ public:
 	bool IsCuckooBackend() const {
 		return UseCuckooTable();
 	}
-	void AddCuckooEntry(hash_t hash, idx_t entry_index) {
-		RegisterCuckooEntry(hash, entry_index);
+	void AddCuckooEntry(hash_t hash, data_ptr_t pointer) {
+		RegisterCuckooEntry(hash, pointer);
 	}
 	TupleDataCollection &GetDataCollection() {
 		return *data_collection;
@@ -361,14 +361,16 @@ private:
 		}
 		return (cuckoo_table != nullptr) || !cuckoo_partitions.empty();
 	}
-	void RegisterCuckooEntry(hash_t hash, idx_t entry_index);
+		void RegisterCuckooEntry(hash_t hash, data_ptr_t pointer);
 	void PrepareCuckooCapacity(idx_t distinct_estimate);
+	void MaybeRetuneCuckoo(idx_t total_entries, idx_t distinct_estimate);
+	void ApplyCuckooConfig(const CuckooTableConfig &config);
 	idx_t EstimateCuckooDistinct(idx_t chunk_idx_from, idx_t chunk_idx_to);
 	bool HasCuckooPartitions() const {
 		return !cuckoo_partitions.empty();
 	}
-	bool InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, idx_t entry_index);
-	bool InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, idx_t entry_index);
+		bool InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, data_ptr_t pointer);
+		bool InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, data_ptr_t pointer);
 	idx_t GetCuckooPartitionIndex(hash_t hash) const;
 	CuckooJoinHashTable *GetCuckooTableForHash(hash_t hash) const;
 	void EnsureCuckooPartitions(idx_t desired_partitions);
@@ -415,6 +417,7 @@ private:
 
 	HashJoinBackend backend;
 	unique_ptr<CuckooJoinHashTable> cuckoo_table;
+	CuckooTableConfig cuckoo_default_config;
 	CuckooTableConfig cuckoo_base_config;
 	vector<unique_ptr<CuckooJoinHashTable>> cuckoo_partitions;
 	idx_t cuckoo_partition_bits = 0;

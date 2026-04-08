@@ -42,9 +42,11 @@ mkdir -p "${RESULTS_DIR}"
 OUTPUT_FILE="${RESULTS_DIR}/benchmark_log.txt"
 TIMING_FILE="${RESULTS_DIR}/timing.csv"
 COMPARISON_FILE="${RESULTS_DIR}/comparison.csv"
+STATS_FILE="${RESULTS_DIR}/cuckoo_stats.csv"
 
 printf "query_file,loop,backend,start_time,end_time,duration_ms,status\n" >"${TIMING_FILE}"
 printf "query_file,avg_linear_ms,avg_cuckoo_ms,delta_ms,delta_percent\n" >"${COMPARISON_FILE}"
+printf "query_file,loop,backend,block_size,load_factor,target_load_factor,kickouts,max_kickout_depth,bfs_failures,stash_entries,stash_hwm,victim_entries,victim_hwm,victim_mode,overflow_entries,rehashes\n" >"${STATS_FILE}"
 
 if [[ -z "${TIMEOUT_BIN}" ]]; then
   if command -v timeout >/dev/null 2>&1; then
@@ -122,6 +124,7 @@ PY
 .timer on
 PRAGMA enable_progress_bar=false;
 PRAGMA threads=${THREADS};
+PRAGMA enable_profiling=json;
 SET hash_join_backend='${backend}';
 EOF
   cat "${tmp_sql}" >>"${tmp_wrapper}"
@@ -146,6 +149,85 @@ EOF
   duration=$((end_epoch_ms - start_epoch_ms))
 
   printf '%s,%s,%s,%s,%s,%s,%s\n' "${sql_path}" "${loop_id}" "${backend}" "${start_human}" "${end_human}" "${duration}" "${status}" >>"${TIMING_FILE}"
+
+  if [[ -f "${stdout_file}" ]] && [[ -s "${stdout_file}" ]]; then
+    python3 - "${stdout_file}" "${sql_path}" "${loop_id}" "${backend}" "${STATS_FILE}" <<'PY'
+import json, sys
+stdout_path, query_path, loop_id, backend, stats_path = sys.argv[1:6]
+text = open(stdout_path, 'r', encoding='utf-8').read()
+profile = None
+start = text.find('{')
+while start != -1:
+    depth = 0
+    for offset, ch in enumerate(text[start:]):
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:start + offset + 1]
+                try:
+                    profile = json.loads(candidate)
+                    break
+                except json.JSONDecodeError:
+                    pass
+    if profile:
+        break
+    start = text.find('{', start + 1)
+
+def find_hash_join(node):
+    if not isinstance(node, dict):
+        return None
+    if node.get('operator_type') == 'HASH_JOIN' or node.get('operator_name') == 'HASH_JOIN':
+        return node
+    for child in node.get('children', []):
+        result = find_hash_join(child)
+        if result:
+            return result
+    return None
+
+def parse_number(value):
+    if value in (None, ''):
+        return ''
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip().replace('%', '')
+    try:
+        if '.' in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+block_size = load_factor = target_load = kickouts = max_depth = bfs_fail = ''
+stash_entries = stash_hwm = victim_entries = victim_hwm = overflow_entries = rehashes = ''
+victim_mode = ''
+
+if profile:
+    hash_node = find_hash_join(profile)
+    if hash_node:
+        extra = hash_node.get('extra_info', {})
+        block_size = parse_number(extra.get('Cuckoo Block Size'))
+        load_factor = parse_number(extra.get('Cuckoo Load Factor'))
+        target_load = parse_number(extra.get('Cuckoo Target Load Factor'))
+        kickouts = parse_number(extra.get('Cuckoo Kickouts'))
+        max_depth = parse_number(extra.get('Cuckoo Max Kickout Depth'))
+        bfs_fail = parse_number(extra.get('Cuckoo BFS Failures'))
+        stash_entries = parse_number(extra.get('Cuckoo Stash Entries'))
+        stash_hwm = parse_number(extra.get('Cuckoo Stash High Watermark'))
+        victim_entries = parse_number(extra.get('Cuckoo Victim Entries'))
+        victim_hwm = parse_number(extra.get('Cuckoo Victim High Watermark'))
+        overflow_entries = parse_number(extra.get('Cuckoo Overflow Entries'))
+        rehashes = parse_number(extra.get('Cuckoo Rehashes'))
+        victim_mode = extra.get('Cuckoo Victim Mode', '')
+
+with open(stats_path, 'a', encoding='utf-8') as out:
+    out.write(
+        f"{query_path},{loop_id},{backend},{block_size},{load_factor},{target_load},{kickouts},{max_depth},{bfs_fail},{stash_entries},{stash_hwm},{victim_entries},{victim_hwm},{victim_mode},{overflow_entries},{rehashes}\n"
+    )
+PY
+  fi
+
   log "    ${backend} duration: ${duration} ms (${status})"
 }
 

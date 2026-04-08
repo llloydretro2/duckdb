@@ -731,6 +731,34 @@ struct HashJoinCuckooStashScaleSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct HashJoinCuckooBucketSlotsSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "hash_join_cuckoo_bucket_slots";
+	static constexpr const char *Description =
+	    "Number of slots per bucket used by the cuckoo hash join backend (2 - 8).";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "4";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct HashJoinCuckooMaxSearchDepthSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "hash_join_cuckoo_max_search_depth";
+	static constexpr const char *Description =
+	    "Maximum relocation depth explored during cuckoo hash join insertions (8 - 1024).";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "64";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct EnableExternalAccessSetting {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_external_access";

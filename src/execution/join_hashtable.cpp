@@ -142,6 +142,9 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
 		cuckoo_config.target_load_factor = client_config.hash_join_cuckoo_load_factor;
 		cuckoo_config.stash_scale = client_config.hash_join_cuckoo_stash_scale;
 		cuckoo_config.min_stash = client_config.hash_join_cuckoo_min_stash;
+		cuckoo_config.bucket_slot_count = client_config.hash_join_cuckoo_bucket_slots;
+		cuckoo_config.max_search_depth = client_config.hash_join_cuckoo_max_search_depth;
+		cuckoo_default_config = cuckoo_config;
 		cuckoo_base_config = cuckoo_config;
 		cuckoo_table = make_uniq<CuckooJoinHashTable>(cuckoo_base_config);
 	}
@@ -415,7 +418,7 @@ void JoinHashTable::GetRowPointersCuckoo(DataChunk &keys, TupleDataChunkState &k
 		candidate_count = 0;
 	};
 
-	std::array<idx_t, CuckooJoinHashTable::MAX_LOOKUP_CANDIDATES> local_candidates {};
+	std::array<data_ptr_t, CuckooJoinHashTable::MAX_LOOKUP_CANDIDATES> local_candidates {};
 	for (idx_t i = 0; i < count; i++) {
 		const auto row_index = current_sel->get_index(i);
 		const auto hash = hashes_dense[i];
@@ -428,12 +431,11 @@ void JoinHashTable::GetRowPointersCuckoo(DataChunk &keys, TupleDataChunkState &k
 			continue;
 		}
 		for (idx_t c = 0; c < candidate_total; c++) {
-			const auto entry_index = local_candidates[c];
-			const auto slot = entry_index & bitmask;
-			if (slot >= capacity) {
+			auto ptr = local_candidates[c];
+			if (!ptr) {
 				continue;
 			}
-			pointer_data[row_index] = entries[slot].GetPointer();
+			pointer_data[row_index] = ptr;
 			state.keys_to_compare_sel.set_index(candidate_count++, row_index);
 			if (candidate_count == STANDARD_VECTOR_SIZE) {
 				flush_candidates();
@@ -799,11 +801,11 @@ static void InsertHashesLoop(atomic<ht_entry_t> entries[], Vector &row_locations
 					salt_match_count += 1;
 				}
 				if (DUCKDB_LIKELY(potential_collided_ptr == nullptr) && cuckoo_hashes) {
-					ht.AddCuckooEntry(cuckoo_hashes[row_index], ht_offset);
+					ht.AddCuckooEntry(cuckoo_hashes[row_index], row_ptr_to_insert);
 				}
 			} else {
 				if (cuckoo_hashes) {
-					ht.AddCuckooEntry(cuckoo_hashes[row_index], ht_offset);
+					ht.AddCuckooEntry(cuckoo_hashes[row_index], row_ptr_to_insert);
 				}
 			}
 
@@ -2072,6 +2074,49 @@ idx_t JoinHashTable::EstimateCuckooDistinct(idx_t chunk_idx_from, idx_t chunk_id
 	return MaxValue<idx_t>(approx, idx_t(1));
 }
 
+void JoinHashTable::ApplyCuckooConfig(const CuckooTableConfig &config) {
+	cuckoo_base_config = config;
+	if (cuckoo_table) {
+		cuckoo_table->Configure(cuckoo_base_config);
+	}
+	for (auto &partition : cuckoo_partitions) {
+		if (!partition) {
+			continue;
+		}
+		partition->Configure(cuckoo_base_config);
+	}
+}
+
+void JoinHashTable::MaybeRetuneCuckoo(idx_t total_entries, idx_t distinct_estimate) {
+	if (backend != HashJoinBackend::CUCKOO || total_entries == 0) {
+		return;
+	}
+	auto tuned = cuckoo_default_config;
+	const double ratio =
+	    ClampValue<double>(static_cast<double>(distinct_estimate) / static_cast<double>(total_entries), 0.0, 1.0);
+	const auto apply_skew = [&](double load_target, idx_t block_slots, idx_t search_depth) {
+		tuned.target_load_factor = MinValue<double>(tuned.target_load_factor, load_target);
+		tuned.bucket_slot_count = MaxValue<idx_t>(tuned.bucket_slot_count, block_slots);
+		tuned.max_search_depth = MaxValue<idx_t>(tuned.max_search_depth, search_depth);
+	};
+	if (ratio <= 0.20) {
+		apply_skew(0.55, 8, 160);
+	} else if (ratio <= 0.35) {
+		apply_skew(0.62, 8, 144);
+	} else if (ratio <= 0.60) {
+		apply_skew(0.68, 8, 128);
+	} else if (ratio <= 0.80) {
+		apply_skew(0.72, 8, 112);
+	} else {
+		apply_skew(tuned.target_load_factor, 8, tuned.max_search_depth);
+	}
+	if (tuned.bucket_slot_count != cuckoo_base_config.bucket_slot_count ||
+	    tuned.target_load_factor != cuckoo_base_config.target_load_factor ||
+	    tuned.max_search_depth != cuckoo_base_config.max_search_depth) {
+		ApplyCuckooConfig(tuned);
+	}
+}
+
 void JoinHashTable::PrepareCuckooCapacity(idx_t distinct_estimate) {
 	if (backend != HashJoinBackend::CUCKOO) {
 		return;
@@ -2084,7 +2129,21 @@ void JoinHashTable::PrepareCuckooCapacity(idx_t distinct_estimate) {
 	if (total_entries == 0) {
 		return;
 	}
+	MaybeRetuneCuckoo(total_entries, distinct_estimate);
 	const idx_t target = distinct_estimate == 0 ? total_entries : MinValue(distinct_estimate, total_entries);
+	static constexpr idx_t CUCKOO_MIN_BUILD = 4096;
+	if (target < CUCKOO_MIN_BUILD) {
+		cuckoo_disabled.store(true);
+		cuckoo_table.reset();
+		cuckoo_partitions.clear();
+		cuckoo_partition_bits = 0;
+		cuckoo_partition_mask = 0;
+		cuckoo_fallback_stats = {};
+		cuckoo_fallback_stats.backend_disabled = true;
+		cuckoo_fallback_stats.fallback_reason_mask = CUCKOO_FALLBACK_REHASH;
+		cuckoo_fallback_stats_valid = true;
+		return;
+	}
 	idx_t desired_partitions = 1;
 	if (target >= CUCKOO_PARTITION_THRESHOLD) {
 		const idx_t partitions =
@@ -2123,15 +2182,29 @@ bool JoinHashTable::TryGetCuckooStats(CuckooRuntimeStats &out_stats) const {
 				aggregated.capacity += stats.capacity;
 				aggregated.entries += stats.entries;
 				aggregated.stash_entries += stats.stash_entries;
+				aggregated.victim_entries += stats.victim_entries;
 				aggregated.stash_high_watermark =
 				    MaxValue<idx_t>(aggregated.stash_high_watermark, stats.stash_high_watermark);
+				aggregated.victim_high_watermark =
+				    MaxValue<idx_t>(aggregated.victim_high_watermark, stats.victim_high_watermark);
 				aggregated.kickouts += stats.kickouts;
+				aggregated.max_kickout_depth =
+				    MaxValue<idx_t>(aggregated.max_kickout_depth, stats.max_kickout_depth);
+				aggregated.bfs_failures += stats.bfs_failures;
 				aggregated.rehashes += stats.rehashes;
+				aggregated.overflow_entries += stats.overflow_entries;
+				aggregated.overflow_high_watermark =
+				    MaxValue<idx_t>(aggregated.overflow_high_watermark, stats.overflow_high_watermark);
 				aggregated.stash_limit = MaxValue<idx_t>(aggregated.stash_limit, stats.stash_limit);
 				aggregated.kickout_limit = MaxValue<idx_t>(aggregated.kickout_limit, stats.kickout_limit);
 				if (!has_stats) {
 					aggregated.target_load_factor = stats.target_load_factor;
 				}
+				aggregated.block_size = MaxValue<idx_t>(aggregated.block_size, stats.block_size);
+				aggregated.bucket_slot_count =
+				    MaxValue<idx_t>(aggregated.bucket_slot_count, stats.bucket_slot_count);
+				aggregated.fallback_reason_mask |= stats.fallback_reason_mask;
+				aggregated.victim_mode = aggregated.victim_mode || stats.victim_mode;
 				has_stats = true;
 			}
 			if (has_stats) {
@@ -2159,22 +2232,24 @@ bool JoinHashTable::TryGetCuckooStats(CuckooRuntimeStats &out_stats) const {
 	return false;
 }
 
-void JoinHashTable::RegisterCuckooEntry(hash_t hash, idx_t entry_index) {
+void JoinHashTable::RegisterCuckooEntry(hash_t hash, data_ptr_t pointer) {
 	if (backend != HashJoinBackend::CUCKOO) {
+		return;
+	}
+	if (!pointer) {
 		return;
 	}
 	lock_guard<mutex> guard(cuckoo_lock);
 	if (cuckoo_disabled.load()) {
 		return;
 	}
-	entry_index &= bitmask;
 	bool success = false;
 	if (HasCuckooPartitions()) {
 		const auto partition_idx =
 		    MinValue<idx_t>(GetCuckooPartitionIndex(hash), cuckoo_partitions.empty() ? idx_t(0) : cuckoo_partitions.size() - 1);
-		success = InsertIntoCuckooPartition(partition_idx, hash, entry_index);
+		success = InsertIntoCuckooPartition(partition_idx, hash, pointer);
 	} else if (cuckoo_table) {
-		success = InsertIntoCuckooTable(*cuckoo_table, hash, entry_index);
+		success = InsertIntoCuckooTable(*cuckoo_table, hash, pointer);
 	}
 	if (success) {
 		return;
@@ -2246,28 +2321,28 @@ void JoinHashTable::EnsureCuckooPartitions(idx_t desired_partitions) {
 	cuckoo_partition_mask = desired_partitions - 1;
 }
 
-bool JoinHashTable::InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, idx_t entry_index) {
-	if (table.Insert(hash, entry_index)) {
+bool JoinHashTable::InsertIntoCuckooTable(CuckooJoinHashTable &table, hash_t hash, data_ptr_t pointer) {
+	if (table.Insert(hash, pointer)) {
 		return true;
 	}
 	idx_t new_capacity = table.Capacity() == 0 ? idx_t(8) : table.Capacity() * 2;
 	new_capacity = MaxValue<idx_t>(new_capacity, table.Size() * 2 + 8);
 	for (idx_t attempt = 0; attempt < 2; attempt++) {
 		table.Reserve(new_capacity);
-		if (table.Insert(hash, entry_index)) {
+		if (table.Insert(hash, pointer)) {
 			return true;
 		}
 		new_capacity = MaxValue<idx_t>(new_capacity * 2, table.Size() * 2 + 8);
 	}
-	return table.Insert(hash, entry_index);
+	return table.Insert(hash, pointer);
 }
 
-bool JoinHashTable::InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, idx_t entry_index) {
+bool JoinHashTable::InsertIntoCuckooPartition(idx_t partition_idx, hash_t hash, data_ptr_t pointer) {
 	if (!HasCuckooPartitions() || partition_idx >= cuckoo_partitions.size()) {
 		return false;
 	}
 	auto &table = *cuckoo_partitions[partition_idx];
-	return InsertIntoCuckooTable(table, hash, entry_index);
+	return InsertIntoCuckooTable(table, hash, pointer);
 }
 
 } // namespace duckdb

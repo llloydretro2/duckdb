@@ -31,6 +31,8 @@ struct CuckooTableConfig {
 	double target_load_factor = 0.5;
 	idx_t stash_scale = 64;
 	idx_t min_stash = 64;
+	idx_t bucket_slot_count = 4;
+	idx_t max_search_depth = 32;
 };
 
 //! Lightweight cuckoo hash table used by the experimental hash join backend.
@@ -39,17 +41,24 @@ struct CuckooRuntimeStats {
 	idx_t capacity = 0;
 	idx_t entries = 0;
 	double target_load_factor = 0;
+	idx_t bucket_slot_count = 0;
+	idx_t block_size = 0;
 	idx_t stash_entries = 0;
 	idx_t stash_high_watermark = 0;
 	idx_t overflow_entries = 0;
 	idx_t overflow_high_watermark = 0;
+	idx_t victim_entries = 0;
+	idx_t victim_high_watermark = 0;
 	idx_t kickouts = 0;
+	idx_t max_kickout_depth = 0;
+	idx_t bfs_failures = 0;
 	idx_t rehashes = 0;
 	idx_t fallback_events = 0;
 	idx_t stash_limit = 0;
 	idx_t kickout_limit = 0;
 	idx_t hash_function_count = 0;
 	uint8_t fallback_reason_mask = 0;
+	bool victim_mode = false;
 	bool backend_disabled = false;
 };
 
@@ -88,10 +97,10 @@ public:
 
 	//! Insert a row pointer identified by the already-computed hash.
 	//! Returns true on success, false if the table/stash overflowed even after a rehash.
-	bool Insert(hash_t hash, idx_t entry_index);
+	bool Insert(hash_t hash, data_ptr_t pointer);
 
 	//! Lookup returns up to max_results row pointers matching the hash
-	idx_t Lookup(hash_t hash, idx_t *results, idx_t max_results) const;
+	idx_t Lookup(hash_t hash, data_ptr_t *results, idx_t max_results) const;
 
 	double LoadFactor() const;
 	CuckooRuntimeStats GetStats() const;
@@ -120,17 +129,21 @@ public:
 private:
 	struct Bucket {
 		hash_t hash;
-		idx_t entry_index;
+		data_ptr_t pointer;
 	};
 
 private:
 	std::vector<Bucket> buckets;
 	std::vector<Bucket> stash;
-	unordered_map<hash_t, std::vector<idx_t>> overflow_map;
+	unordered_map<hash_t, std::vector<data_ptr_t>> overflow_map;
+	unordered_map<hash_t, std::vector<data_ptr_t>> victim_map;
 
 	idx_t capacity;
 	idx_t mask;
 	idx_t size;
+	idx_t bucket_slot_count = BUCKET_SLOT_COUNT;
+	idx_t bucket_count = 0;
+	idx_t bucket_mask = 0;
 
 	double configured_load_factor = 0.5;
 	idx_t configured_stash_scale = 64;
@@ -148,37 +161,58 @@ private:
 	idx_t overflow_high_watermark = 0;
 	idx_t cumulative_overflow_entries = 0;
 	idx_t cumulative_stash_high_watermark = 0;
-	idx_t max_rehash_attempts = 3;
+	idx_t max_kickout_depth = 0;
+	idx_t bfs_failure_count = 0;
+	idx_t recent_kickouts = 0;
+	idx_t victim_entries = 0;
+	idx_t victim_high_watermark = 0;
+	idx_t victim_capacity = 0;
+	bool victim_mode = false;
+	idx_t max_rehash_attempts = 2;
 	mutable uint8_t fallback_reason_mask = 0;
-	mutable unordered_map<hash_t, idx_t> hot_entries;
+	mutable unordered_map<hash_t, data_ptr_t> hot_entries;
 	unordered_map<hash_t, idx_t> stash_frequencies;
 	unordered_map<hash_t, idx_t> collision_counts;
 	idx_t duplicate_updates = 0;
-	idx_t total_insert_attempts = 0;
-	double observed_duplicate_ratio = 0.0;
-	static constexpr idx_t HOT_KEY_THRESHOLD = 8;
-	static constexpr idx_t HOT_COLLISION_THRESHOLD = 4;
+ 	idx_t total_insert_attempts = 0;
+ 	double observed_duplicate_ratio = 0.0;
+ 	static constexpr idx_t HOT_KEY_THRESHOLD = 8;
+ 	static constexpr idx_t HOT_COLLISION_THRESHOLD = 4;
+ 	idx_t configured_max_search_depth = 32;
+	bool observed_kickout = false;
+	idx_t collision_free_sequence = 0;
 
 private:
 	void Grow(idx_t new_capacity);
 	void UpdateAdaptiveLimits();
 	bool ShouldExpand() const;
 	bool ShouldForceFallback();
-	bool PromoteHotKey(hash_t hash, idx_t entry_index);
-	void RecordDuplicate();
+	bool PromoteHotKey(hash_t hash, data_ptr_t pointer);
 	enum class PlaceStatus : uint8_t { PLACED, DUPLICATE, FULL };
-	PlaceStatus InsertOrRehash(hash_t hash, idx_t entry_index, bool allow_rehash);
-	PlaceStatus TryPlace(idx_t slot, hash_t hash, idx_t entry_index);
-	PlaceStatus Kickout(idx_t slot, idx_t function_index, hash_t hash, idx_t entry_index);
-	PlaceStatus PushToStash(hash_t hash, idx_t entry_index);
+	void RecordDuplicate();
+	void RecordKickoutDepth(idx_t depth);
+	void RecordBfsFailure();
+	void MaybeTuneParameters();
+	PlaceStatus InsertIntoVictim(hash_t hash, data_ptr_t pointer);
+	bool ShouldActivateVictimMode() const;
+	auto BuildKickoutPath(hash_t hash, data_ptr_t pointer, const std::array<idx_t, NUM_HASH_FUNCTIONS> &slots)
+ -> PlaceStatus;
+	PlaceStatus InsertOrRehash(hash_t hash, data_ptr_t pointer, bool allow_rehash);
+	PlaceStatus TryPlace(idx_t bucket_idx, hash_t hash, data_ptr_t pointer);
+	PlaceStatus PushToStash(hash_t hash, data_ptr_t pointer);
 	void Rehash(idx_t new_capacity);
 
 	idx_t HashSlot(hash_t hash, idx_t function_index) const;
-	idx_t FindFunctionIndex(hash_t hash, idx_t slot) const;
+	idx_t FindFunctionIndex(hash_t hash, idx_t bucket_idx) const;
+	void UpdateBucketGeometry();
+	void UpdateVictimCapacity();
 	double AdaptiveLoadFactor(idx_t count) const;
 	idx_t AdaptiveStashScale(idx_t current_capacity) const;
-	void PushToOverflow(hash_t hash, idx_t entry_index);
+	void PushToOverflow(hash_t hash, data_ptr_t pointer);
 	void ResetCollisionCounter(hash_t hash);
+	idx_t SlotBase(idx_t bucket_idx) const;
+	void RelaxLoadFactor();
+	bool ShouldOverflowOnFailure() const;
 };
 
 } // namespace duckdb

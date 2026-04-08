@@ -134,6 +134,7 @@ if hash_join:
         "cuckoo_load_factor": extra.get("Cuckoo Load Factor"),
         "cuckoo_capacity": extra.get("Cuckoo Capacity"),
         "cuckoo_entries": extra.get("Cuckoo Entries"),
+        "cuckoo_bucket_slots": extra.get("Cuckoo Bucket Slots"),
         "cuckoo_stash_entries": extra.get("Cuckoo Stash Entries"),
         "cuckoo_stash_high_watermark": extra.get("Cuckoo Stash High Watermark"),
         "cuckoo_kickouts": extra.get("Cuckoo Kickouts"),

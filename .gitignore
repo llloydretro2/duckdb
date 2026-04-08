@@ -369,3 +369,4 @@ job_perf/**
 job_query_benchmark/**
 job_query_profiles/**
 synthetic_perf/**
+job_query_focus/**

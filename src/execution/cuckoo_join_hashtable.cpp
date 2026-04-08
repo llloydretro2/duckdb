@@ -11,6 +11,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/exception.hpp"
 #include <cmath>
+#include <queue>
 #include <utility>
 
 namespace duckdb {
@@ -54,7 +55,7 @@ CuckooJoinHashTable::CuckooJoinHashTable(const CuckooTableConfig &config, idx_t 
 void CuckooJoinHashTable::Reset() {
 	for (auto &bucket : buckets) {
 		bucket.hash = 0;
-		bucket.entry_index = DConstants::INVALID_INDEX;
+		bucket.pointer = nullptr;
 	}
 	stash.clear();
 	size = 0;
@@ -62,10 +63,21 @@ void CuckooJoinHashTable::Reset() {
 	rehash_count = 0;
 	stash_high_watermark = 0;
 	overflow_map.clear();
+	victim_map.clear();
 	overflow_entries = 0;
 	overflow_high_watermark = 0;
 	cumulative_overflow_entries = 0;
 	cumulative_stash_high_watermark = 0;
+	max_kickout_depth = 0;
+	bfs_failure_count = 0;
+	recent_kickouts = 0;
+	victim_entries = 0;
+	victim_high_watermark = 0;
+	victim_mode = false;
+	victim_capacity = 0;
+	observed_kickout = false;
+	collision_free_sequence = 0;
+	UpdateBucketGeometry();
 	UpdateAdaptiveLimits();
 	fallback_reason_mask = CUCKOO_FALLBACK_NONE;
 	hot_entries.clear();
@@ -77,12 +89,20 @@ void CuckooJoinHashTable::Reset() {
 }
 
 void CuckooJoinHashTable::Configure(const CuckooTableConfig &config) {
-	auto capped_target = MinValue<double>(config.target_load_factor, 0.4);
-	configured_load_factor = ClampValue<double>(capped_target, 0.1, 0.4);
+	auto capped_target = MinValue<double>(config.target_load_factor, 0.9);
+	configured_load_factor = ClampValue<double>(capped_target, 0.4, 0.9);
 	max_load_factor = configured_load_factor;
 	stash_scale = MaxValue<idx_t>(idx_t(1), config.stash_scale);
 	configured_stash_scale = stash_scale;
-	configured_min_stash = 32;
+	configured_min_stash = MaxValue<idx_t>(idx_t(1), config.min_stash);
+	idx_t desired_slots = MaxValue<idx_t>(idx_t(1), config.bucket_slot_count);
+	idx_t clamped_slots = 1;
+	while (clamped_slots < desired_slots && clamped_slots < 8) {
+		clamped_slots <<= 1;
+	}
+	bucket_slot_count = clamped_slots;
+	configured_max_search_depth = MaxValue<idx_t>(idx_t(1), config.max_search_depth);
+	UpdateBucketGeometry();
 	UpdateAdaptiveLimits();
 }
 
@@ -111,7 +131,7 @@ void CuckooJoinHashTable::Reserve(idx_t count) {
 	Rehash(min_capacity);
 }
 
-bool CuckooJoinHashTable::Insert(hash_t hash, idx_t entry_index) {
+bool CuckooJoinHashTable::Insert(hash_t hash, data_ptr_t pointer) {
 	idx_t attempts = 0;
 	while (true) {
 		total_insert_attempts++;
@@ -132,123 +152,206 @@ bool CuckooJoinHashTable::Insert(hash_t hash, idx_t entry_index) {
 		if ((size + 1.0) > static_cast<double>(capacity) * max_load_factor) {
 			Rehash(capacity * 2);
 		}
-		const auto status = InsertOrRehash(hash, entry_index, true);
-	if (status == PlaceStatus::FULL) {
-		if (++attempts > max_rehash_attempts) {
-			fallback_reason_mask |= CUCKOO_FALLBACK_REHASH;
-			return false;
+		const auto status = InsertOrRehash(hash, pointer, true);
+		if (status == PlaceStatus::FULL) {
+			if (++attempts > max_rehash_attempts) {
+				fallback_reason_mask |= CUCKOO_FALLBACK_REHASH;
+				return false;
+			}
+			Rehash(capacity * 2);
+			continue;
 		}
-		Rehash(capacity * 2);
-		continue;
-	}
 		if (status == PlaceStatus::PLACED) {
 			size++;
+			RelaxLoadFactor();
 		}
 		stash_high_watermark = MaxValue<idx_t>(stash_high_watermark, stash.size());
 		return true;
 	}
 }
 
-auto CuckooJoinHashTable::InsertOrRehash(hash_t hash, idx_t entry_index, bool allow_rehash) -> PlaceStatus {
+auto CuckooJoinHashTable::InsertOrRehash(hash_t hash, data_ptr_t pointer, bool allow_rehash) -> PlaceStatus {
 	std::array<idx_t, NUM_HASH_FUNCTIONS> slots;
 	for (idx_t i = 0; i < NUM_HASH_FUNCTIONS; i++) {
 		slots[i] = HashSlot(hash, i);
-		auto status = TryPlace(slots[i], hash, entry_index);
+		auto status = TryPlace(slots[i], hash, pointer);
 		if (status != PlaceStatus::FULL) {
 			return status;
 		}
 	}
-	auto status = Kickout(slots[0], 0, hash, entry_index);
+	auto status = BuildKickoutPath(hash, pointer, slots);
 	if (status != PlaceStatus::FULL) {
 		return status;
 	}
-	auto stash_status = PushToStash(hash, entry_index);
+	if (ShouldActivateVictimMode()) {
+		auto victim_status = InsertIntoVictim(hash, pointer);
+		if (victim_status != PlaceStatus::FULL) {
+			return victim_status;
+		}
+	}
+	auto stash_status = PushToStash(hash, pointer);
 	if (stash_status != PlaceStatus::FULL) {
 		return stash_status;
 	}
-	if (allow_rehash) {
-		Rehash(capacity * 2);
-		return InsertOrRehash(hash, entry_index, false);
-	}
-	return PlaceStatus::FULL;
-}
-
-auto CuckooJoinHashTable::TryPlace(idx_t slot, hash_t hash, idx_t entry_index) -> PlaceStatus {
-	auto &bucket = buckets[slot];
-	if (bucket.entry_index == DConstants::INVALID_INDEX) {
-		bucket.hash = hash;
-		bucket.entry_index = entry_index;
-		ResetCollisionCounter(hash);
+	if (ShouldOverflowOnFailure()) {
+		PushToOverflow(hash, pointer);
 		return PlaceStatus::PLACED;
 	}
-	if (bucket.hash == hash) {
-		// duplicate key: update head pointer so overflow chains remain reachable
-		bucket.entry_index = entry_index;
-		auto hot_entry = hot_entries.find(hash);
-		if (hot_entry != hot_entries.end()) {
-			hot_entry->second = entry_index;
-		}
-		auto &freq = stash_frequencies[hash];
-		freq++;
-		if (freq >= HOT_KEY_THRESHOLD) {
-			hot_entries[hash] = entry_index;
-		}
-		RecordDuplicate();
-		ResetCollisionCounter(hash);
-		return PlaceStatus::DUPLICATE;
+	if (allow_rehash) {
+		Rehash(capacity * 2);
+		return InsertOrRehash(hash, pointer, false);
 	}
 	return PlaceStatus::FULL;
 }
 
-auto CuckooJoinHashTable::Kickout(idx_t slot, idx_t function_index, hash_t hash, idx_t entry_index) -> PlaceStatus {
-	idx_t current_slot = slot;
-	idx_t current_function = function_index;
-	hash_t current_hash = hash;
-	idx_t current_entry = entry_index;
-
-	for (idx_t kick = 0; kick < kickout_limit; kick++) {
-		auto &victim = buckets[current_slot];
-		std::swap(current_hash, victim.hash);
-		std::swap(current_entry, victim.entry_index);
-		total_kickouts++;
-		auto &collision = collision_counts[current_hash];
-		collision++;
-		if (collision >= HOT_COLLISION_THRESHOLD || kick + 1 >= kickout_limit) {
-			auto status = PushToStash(current_hash, current_entry);
-			if (status != PlaceStatus::PLACED) {
-				return status;
-			}
+auto CuckooJoinHashTable::TryPlace(idx_t slot, hash_t hash, data_ptr_t pointer) -> PlaceStatus {
+	if (!mask) {
+		return PlaceStatus::FULL;
+	}
+	const idx_t base = SlotBase(slot);
+	for (idx_t offset = 0; offset < bucket_slot_count; offset++) {
+		const idx_t idx = (base + offset) & mask;
+		auto &bucket = buckets[idx];
+		if (bucket.pointer == nullptr) {
+			bucket.hash = hash;
+			bucket.pointer = pointer;
+			ResetCollisionCounter(hash);
 			return PlaceStatus::PLACED;
 		}
-		current_function = FindFunctionIndex(current_hash, current_slot);
-		current_function = (current_function + 1) % NUM_HASH_FUNCTIONS;
-		current_slot = HashSlot(current_hash, current_function);
-		auto status = TryPlace(current_slot, current_hash, current_entry);
-		if (status != PlaceStatus::FULL) {
-			return status;
+		if (bucket.hash == hash) {
+			// duplicate key: update head pointer so overflow chains remain reachable
+			bucket.pointer = pointer;
+			auto hot_entry = hot_entries.find(hash);
+			if (hot_entry != hot_entries.end()) {
+				hot_entry->second = pointer;
+			}
+			auto &freq = stash_frequencies[hash];
+			freq++;
+			if (freq >= HOT_KEY_THRESHOLD) {
+				hot_entries[hash] = pointer;
+			}
+			RecordDuplicate();
+			ResetCollisionCounter(hash);
+			return PlaceStatus::DUPLICATE;
+		}
+	}
+	return PlaceStatus::FULL;
+}
+
+auto CuckooJoinHashTable::BuildKickoutPath(hash_t hash, data_ptr_t pointer,
+                                           const std::array<idx_t, NUM_HASH_FUNCTIONS> &slots) -> PlaceStatus {
+	if (!mask || capacity == 0) {
+		return PlaceStatus::FULL;
+	}
+	struct PathNode {
+		idx_t slot;
+		idx_t parent;
+		idx_t depth;
+	};
+	std::vector<PathNode> nodes;
+	nodes.reserve(64);
+	std::queue<idx_t> pending;
+	std::vector<uint8_t> visited(capacity, 0);
+
+	auto relocate = [&](idx_t node_idx, idx_t empty_slot) -> PlaceStatus {
+		idx_t target_slot = empty_slot;
+		idx_t depth = 0;
+		while (node_idx != DConstants::INVALID_INDEX) {
+			auto &path_node = nodes[node_idx];
+			auto &source = buckets[path_node.slot];
+			auto &dest = buckets[target_slot];
+			dest = source;
+			source.pointer = nullptr;
+			source.hash = 0;
+			target_slot = path_node.slot;
+			node_idx = path_node.parent;
+			depth++;
+		}
+		auto &dest = buckets[target_slot];
+		dest.hash = hash;
+		dest.pointer = pointer;
+		RecordKickoutDepth(depth);
+		ResetCollisionCounter(hash);
+		return PlaceStatus::PLACED;
+	};
+
+	auto enqueue_slot = [&](idx_t slot, idx_t parent, idx_t depth) {
+		if (visited[slot]) {
+			return;
+		}
+		visited[slot] = 1;
+		nodes.push_back({slot, parent, depth});
+		pending.push(nodes.size() - 1);
+	};
+
+	// seed BFS with the immediate candidate blocks
+	for (idx_t i = 0; i < NUM_HASH_FUNCTIONS; i++) {
+		const idx_t base = slots[i];
+		for (idx_t offset = 0; offset < bucket_slot_count; offset++) {
+			const idx_t candidate = (base + offset) & mask;
+			auto &bucket = buckets[candidate];
+			if (bucket.pointer == nullptr) {
+				auto &dest = buckets[candidate];
+				dest.hash = hash;
+				dest.pointer = pointer;
+				return PlaceStatus::PLACED;
+			}
+			enqueue_slot(candidate, DConstants::INVALID_INDEX, 1);
 		}
 	}
 
-	return PushToStash(current_hash, current_entry);
+	while (!pending.empty()) {
+		const auto node_idx = pending.front();
+		pending.pop();
+		const auto &node = nodes[node_idx];
+		if (node.depth >= configured_max_search_depth) {
+			continue;
+		}
+		auto &victim = buckets[node.slot];
+		if (victim.pointer == nullptr) {
+			return relocate(node_idx, node.slot);
+		}
+		const idx_t current_function = FindFunctionIndex(victim.hash, node.slot);
+		for (idx_t func = 0; func < NUM_HASH_FUNCTIONS; func++) {
+			if (func == current_function) {
+				continue;
+			}
+			const idx_t base = HashSlot(victim.hash, func);
+			for (idx_t offset = 0; offset < bucket_slot_count; offset++) {
+				const idx_t candidate = (base + offset) & mask;
+				if (candidate == node.slot) {
+					continue;
+				}
+				auto &candidate_bucket = buckets[candidate];
+				if (candidate_bucket.pointer == nullptr) {
+					return relocate(node_idx, candidate);
+				}
+				enqueue_slot(candidate, node_idx, node.depth + 1);
+			}
+		}
+	}
+
+	RecordBfsFailure();
+	return PlaceStatus::FULL;
 }
 
-auto CuckooJoinHashTable::PushToStash(hash_t hash, idx_t entry_index) -> PlaceStatus {
-	if (PromoteHotKey(hash, entry_index)) {
+auto CuckooJoinHashTable::PushToStash(hash_t hash, data_ptr_t pointer) -> PlaceStatus {
+	if (PromoteHotKey(hash, pointer)) {
 		return PlaceStatus::PLACED;
 	}
 	for (auto &entry : stash) {
 		if (entry.hash == hash) {
-			entry.entry_index = entry_index;
+			entry.pointer = pointer;
 			return PlaceStatus::DUPLICATE;
 		}
 	}
 	ResetCollisionCounter(hash);
 	const idx_t eager_limit = stash_limit > 0 ? MaxValue<idx_t>(idx_t(1), stash_limit / 2) : 1;
 	if (stash.size() >= eager_limit) {
-		PushToOverflow(hash, entry_index);
+		PushToOverflow(hash, pointer);
 		return PlaceStatus::PLACED;
 	}
-	stash.push_back({hash, entry_index});
+	stash.push_back({hash, pointer});
 	stash_high_watermark = MaxValue<idx_t>(stash_high_watermark, stash.size());
 	cumulative_stash_high_watermark = MaxValue<idx_t>(cumulative_stash_high_watermark, stash_high_watermark);
 	if (stash_limit > 0 && stash.size() > stash_limit) {
@@ -270,16 +373,20 @@ void CuckooJoinHashTable::Rehash(idx_t new_capacity) {
 	vector<Bucket> old_buckets = std::move(buckets);
 	vector<Bucket> old_stash = std::move(stash);
 	auto old_overflow = std::move(overflow_map);
+	auto old_victims = std::move(victim_map);
 	overflow_entries = 0;
 	overflow_high_watermark = MaxValue<idx_t>(overflow_high_watermark, overflow_entries);
+	victim_entries = 0;
+	victim_high_watermark = 0;
+	victim_mode = false;
 
 	capacity = MaxValue<idx_t>(8, NextPowerOfTwo(new_capacity));
-	mask = capacity - 1;
+	UpdateBucketGeometry();
 	buckets.clear();
 	buckets.resize(capacity);
 	for (auto &bucket : buckets) {
 		bucket.hash = 0;
-		bucket.entry_index = DConstants::INVALID_INDEX;
+		bucket.pointer = nullptr;
 	}
 	stash.clear();
 	cumulative_stash_high_watermark = MaxValue<idx_t>(cumulative_stash_high_watermark, stash_high_watermark);
@@ -289,47 +396,59 @@ void CuckooJoinHashTable::Rehash(idx_t new_capacity) {
 	collision_counts.clear();
 
 	for (auto &entry : old_buckets) {
-		if (entry.entry_index == DConstants::INVALID_INDEX) {
+		if (entry.pointer == nullptr) {
 			continue;
 		}
-		auto status = InsertOrRehash(entry.hash, entry.entry_index, false);
+		auto status = InsertOrRehash(entry.hash, entry.pointer, false);
 		if (status == PlaceStatus::PLACED) {
 			size++;
 		}
 	}
 	for (auto &entry : old_stash) {
-		if (entry.entry_index == DConstants::INVALID_INDEX) {
+		if (entry.pointer == nullptr) {
 			continue;
 		}
-		auto status = InsertOrRehash(entry.hash, entry.entry_index, false);
+		auto status = InsertOrRehash(entry.hash, entry.pointer, false);
 		if (status == PlaceStatus::PLACED) {
 			size++;
 		}
 	}
 	for (auto &kv : old_overflow) {
-		for (auto entry_index : kv.second) {
-			auto status = InsertOrRehash(kv.first, entry_index, false);
+		for (auto pointer : kv.second) {
+			auto status = InsertOrRehash(kv.first, pointer, false);
 			if (status == PlaceStatus::PLACED) {
 				size++;
 			} else {
-				PushToOverflow(kv.first, entry_index);
+				PushToOverflow(kv.first, pointer);
+			}
+		}
+	}
+	for (auto &kv : old_victims) {
+		for (auto pointer : kv.second) {
+			auto status = InsertOrRehash(kv.first, pointer, false);
+			if (status == PlaceStatus::PLACED) {
+				size++;
+			} else {
+				InsertIntoVictim(kv.first, pointer);
 			}
 		}
 	}
 }
 
 idx_t CuckooJoinHashTable::HashSlot(hash_t hash, idx_t function_index) const {
-	if (!mask) {
+	if (!bucket_mask) {
 		return 0;
 	}
 	const auto idx = function_index % NUM_HASH_FUNCTIONS;
 	const auto derived = DeriveHash(hash, CUCKOO_HASH_SEEDS[idx], CUCKOO_HASH_ROT[idx]);
-	return derived & mask;
+	const auto bucket_idx = derived & bucket_mask;
+	return (bucket_idx * bucket_slot_count) & mask;
 }
 
 idx_t CuckooJoinHashTable::FindFunctionIndex(hash_t hash, idx_t slot) const {
+	const auto base_slot = SlotBase(slot);
 	for (idx_t i = 0; i < NUM_HASH_FUNCTIONS; i++) {
-		if (HashSlot(hash, i) == slot) {
+		if (HashSlot(hash, i) == base_slot) {
 			return i;
 		}
 	}
@@ -339,20 +458,20 @@ idx_t CuckooJoinHashTable::FindFunctionIndex(hash_t hash, idx_t slot) const {
 double CuckooJoinHashTable::AdaptiveLoadFactor(idx_t count) const {
 	double adaptive = configured_load_factor;
 	if (count >= 2000000) {
-		adaptive = MinValue<double>(adaptive, 0.25);
+		adaptive = MinValue<double>(adaptive, 0.60);
 	} else if (count >= 1000000) {
-		adaptive = MinValue<double>(adaptive, 0.30);
+		adaptive = MinValue<double>(adaptive, 0.65);
 	} else if (count >= 500000) {
-		adaptive = MinValue<double>(adaptive, 0.33);
+		adaptive = MinValue<double>(adaptive, 0.68);
 	} else if (count >= 200000) {
-		adaptive = MinValue<double>(adaptive, 0.35);
+		adaptive = MinValue<double>(adaptive, 0.70);
 	}
 	if (observed_duplicate_ratio > 0.15) {
-		adaptive = MinValue<double>(configured_load_factor, adaptive + 0.1);
+		adaptive = MinValue<double>(configured_load_factor, adaptive + 0.05);
 	} else if (observed_duplicate_ratio < 0.01 && count > 100000) {
-		adaptive = MinValue<double>(adaptive, configured_load_factor - 0.1);
+		adaptive = MinValue<double>(configured_load_factor, adaptive + 0.02);
 	}
-	return ClampValue<double>(adaptive, 0.15, configured_load_factor);
+	return ClampValue<double>(adaptive, 0.5, configured_load_factor);
 }
 
 idx_t CuckooJoinHashTable::AdaptiveStashScale(idx_t current_capacity) const {
@@ -370,14 +489,21 @@ idx_t CuckooJoinHashTable::AdaptiveStashScale(idx_t current_capacity) const {
 	return scale;
 }
 
-idx_t CuckooJoinHashTable::Lookup(hash_t hash, idx_t *results, idx_t max_results) const {
+idx_t CuckooJoinHashTable::Lookup(hash_t hash, data_ptr_t *results, idx_t max_results) const {
 	if (capacity == 0 || !results || max_results == 0) {
 		return 0;
 	}
 	idx_t count = 0;
 	const auto append_result = [&](const Bucket &bucket) {
-		if (bucket.entry_index != DConstants::INVALID_INDEX && bucket.hash == hash) {
-			results[count++] = bucket.entry_index;
+		if (bucket.pointer != nullptr && bucket.hash == hash) {
+			results[count++] = bucket.pointer;
+		}
+	};
+	const auto append_bucket_range = [&](idx_t slot) {
+		const idx_t base = SlotBase(slot);
+		for (idx_t offset = 0; offset < bucket_slot_count && count < max_results; offset++) {
+			const idx_t idx = (base + offset) & mask;
+			append_result(buckets[idx]);
 		}
 	};
 	std::array<idx_t, NUM_HASH_FUNCTIONS> unique_slots;
@@ -395,17 +521,17 @@ idx_t CuckooJoinHashTable::Lookup(hash_t hash, idx_t *results, idx_t max_results
 			continue;
 		}
 		unique_slots[slot_count++] = slot;
-		append_result(buckets[slot]);
+		append_bucket_range(slot);
 		if (count >= max_results) {
 			return count;
 		}
 	}
 	if (count < max_results) {
 		for (auto &entry : stash) {
-			if (entry.hash != hash || entry.entry_index == DConstants::INVALID_INDEX) {
+			if (entry.hash != hash || entry.pointer == nullptr) {
 				continue;
 			}
-			results[count++] = entry.entry_index;
+			results[count++] = entry.pointer;
 			if (count == max_results) {
 				break;
 			}
@@ -420,8 +546,19 @@ idx_t CuckooJoinHashTable::Lookup(hash_t hash, idx_t *results, idx_t max_results
 	if (count < max_results) {
 		auto overflow_entry = overflow_map.find(hash);
 		if (overflow_entry != overflow_map.end()) {
-			for (auto entry_index : overflow_entry->second) {
-				results[count++] = entry_index;
+			for (auto pointer : overflow_entry->second) {
+				results[count++] = pointer;
+				if (count == max_results) {
+					break;
+				}
+			}
+		}
+	}
+	if (count < max_results) {
+		auto victim_entry = victim_map.find(hash);
+		if (victim_entry != victim_map.end()) {
+			for (auto pointer : victim_entry->second) {
+				results[count++] = pointer;
 				if (count == max_results) {
 					break;
 				}
@@ -443,14 +580,20 @@ CuckooRuntimeStats CuckooJoinHashTable::GetStats() const {
 	stats.capacity = capacity;
 	stats.entries = size;
 	stats.target_load_factor = max_load_factor;
+	stats.block_size = bucket_slot_count;
 	stats.stash_entries = stash.size();
 	stats.stash_high_watermark = MaxValue<idx_t>(stash_high_watermark, cumulative_stash_high_watermark);
 	stats.kickouts = total_kickouts;
+	stats.max_kickout_depth = max_kickout_depth;
+	stats.bfs_failures = bfs_failure_count;
 	stats.rehashes = rehash_count;
+	stats.victim_entries = victim_entries;
+	stats.victim_high_watermark = victim_high_watermark;
 	stats.load_factor = LoadFactor();
 	stats.stash_limit = stash_limit;
 	stats.kickout_limit = kickout_limit;
 	stats.hash_function_count = NUM_HASH_FUNCTIONS;
+	stats.bucket_slot_count = bucket_slot_count;
 	stats.fallback_reason_mask = fallback_reason_mask;
 	stats.overflow_entries = cumulative_overflow_entries;
 	stats.overflow_high_watermark = MaxValue<idx_t>(overflow_high_watermark, cumulative_overflow_entries);
@@ -458,18 +601,20 @@ CuckooRuntimeStats CuckooJoinHashTable::GetStats() const {
 	stats.stash_entries += overflow_entries;
 	stats.stash_high_watermark = MaxValue<idx_t>(stash_high_watermark, overflow_high_watermark);
 	stats.fallback_reason_mask = fallback_reason_mask;
+	stats.victim_mode = victim_mode;
 	return stats;
 }
 
 void CuckooJoinHashTable::UpdateAdaptiveLimits() {
+	stash_scale = MaxValue<idx_t>(idx_t(1), configured_stash_scale);
 	if (capacity == 0) {
-		stash_scale = configured_stash_scale;
 		stash_limit = configured_min_stash;
-		kickout_limit = 32;
-		return;
+	} else {
+		const idx_t scaled = capacity / stash_scale;
+		stash_limit = MaxValue<idx_t>(configured_min_stash, scaled);
 	}
-	stash_limit = 32;
-	kickout_limit = observed_duplicate_ratio > 0.10 ? idx_t(8) : idx_t(16);
+	const idx_t base_kickout = observed_duplicate_ratio > 0.10 ? idx_t(8) : idx_t(32);
+	kickout_limit = MinValue<idx_t>(configured_max_search_depth, base_kickout);
 }
 
 bool CuckooJoinHashTable::ShouldExpand() const {
@@ -498,8 +643,7 @@ bool CuckooJoinHashTable::ShouldForceFallback() {
 	if (stash_pressure) {
 		mask |= CUCKOO_FALLBACK_STASH;
 	}
-	const bool rehash_pressure =
-	    rehash_count >= max_rehash_attempts && stash_high_watermark >= MaxValue<idx_t>(idx_t(1), stash_limit / 2);
+	const bool rehash_pressure = rehash_count >= max_rehash_attempts;
 	if (rehash_pressure) {
 		mask |= CUCKOO_FALLBACK_REHASH;
 	}
@@ -513,7 +657,7 @@ bool CuckooJoinHashTable::ShouldForceFallback() {
 	return mask != CUCKOO_FALLBACK_NONE;
 }
 
-bool CuckooJoinHashTable::PromoteHotKey(hash_t hash, idx_t entry_index) {
+bool CuckooJoinHashTable::PromoteHotKey(hash_t hash, data_ptr_t pointer) {
 	auto freq_entry = stash_frequencies.find(hash);
 	if (freq_entry == stash_frequencies.end()) {
 		stash_frequencies.emplace(hash, 1);
@@ -522,7 +666,7 @@ bool CuckooJoinHashTable::PromoteHotKey(hash_t hash, idx_t entry_index) {
 	auto &freq = freq_entry->second;
 	freq++;
 	if (freq >= HOT_KEY_THRESHOLD) {
-		hot_entries[hash] = entry_index;
+		hot_entries[hash] = pointer;
 		return true;
 	}
 	return false;
@@ -540,9 +684,81 @@ void CuckooJoinHashTable::RecordDuplicate() {
 	}
 }
 
-void CuckooJoinHashTable::PushToOverflow(hash_t hash, idx_t entry_index) {
+void CuckooJoinHashTable::RecordKickoutDepth(idx_t depth) {
+	if (depth == 0) {
+		return;
+	}
+	observed_kickout = true;
+	collision_free_sequence = 0;
+	total_kickouts += depth;
+	recent_kickouts += depth;
+	max_kickout_depth = MaxValue<idx_t>(max_kickout_depth, depth);
+	if (recent_kickouts >= MaxValue<idx_t>(idx_t(64), capacity / 8)) {
+		MaybeTuneParameters();
+		recent_kickouts = 0;
+	}
+}
+
+void CuckooJoinHashTable::RecordBfsFailure() {
+	observed_kickout = true;
+	collision_free_sequence = 0;
+	bfs_failure_count++;
+	if (bfs_failure_count % 4 == 0 && max_load_factor > 0.35) {
+		max_load_factor = MaxValue<double>(0.35, max_load_factor - 0.05);
+	}
+	if (!victim_mode && ShouldActivateVictimMode()) {
+		victim_mode = true;
+	}
+}
+
+void CuckooJoinHashTable::MaybeTuneParameters() {
+	const double current_load = LoadFactor();
+	if (current_load > max_load_factor * 0.95 && max_load_factor > 0.35) {
+		max_load_factor = MaxValue<double>(0.35, max_load_factor - 0.03);
+	} else if (current_load < configured_load_factor * 0.5 && max_load_factor < configured_load_factor) {
+		max_load_factor = MinValue<double>(configured_load_factor, max_load_factor + 0.02);
+	}
+	if (max_kickout_depth >= configured_max_search_depth - 4 && configured_max_search_depth < 256) {
+		configured_max_search_depth = MinValue<idx_t>(idx_t(256), configured_max_search_depth + 8);
+	} else if (max_kickout_depth < configured_max_search_depth / 4 && configured_max_search_depth > 32) {
+		configured_max_search_depth = MaxValue<idx_t>(idx_t(32), configured_max_search_depth - 4);
+	}
+}
+
+auto CuckooJoinHashTable::InsertIntoVictim(hash_t hash, data_ptr_t pointer) -> PlaceStatus {
+	if (victim_capacity == 0 && capacity == 0) {
+		return PlaceStatus::FULL;
+	}
+	victim_mode = true;
+	auto &bucket = victim_map[hash];
+	bucket.push_back(pointer);
+	victim_entries++;
+	victim_high_watermark = MaxValue<idx_t>(victim_high_watermark, victim_entries);
+	ResetCollisionCounter(hash);
+	if (victim_entries > victim_capacity && victim_capacity > 0) {
+		fallback_reason_mask |= CUCKOO_FALLBACK_KICKOUT;
+		return PlaceStatus::FULL;
+	}
+	return PlaceStatus::PLACED;
+}
+
+bool CuckooJoinHashTable::ShouldActivateVictimMode() const {
+	if (victim_capacity == 0) {
+		return false;
+	}
+	if (victim_mode) {
+		return true;
+	}
+	const idx_t failure_threshold = 4;
+	if (bfs_failure_count >= failure_threshold) {
+		return true;
+	}
+	return false;
+}
+
+void CuckooJoinHashTable::PushToOverflow(hash_t hash, data_ptr_t pointer) {
 	auto &bucket = overflow_map[hash];
-	bucket.push_back(entry_index);
+	bucket.push_back(pointer);
 	overflow_entries++;
 	cumulative_overflow_entries++;
 	overflow_high_watermark = MaxValue<idx_t>(overflow_high_watermark, overflow_entries);
@@ -558,4 +774,79 @@ void CuckooJoinHashTable::ResetCollisionCounter(hash_t hash) {
 		collision_counts.erase(it);
 	}
 }
+
+idx_t CuckooJoinHashTable::SlotBase(idx_t bucket_idx) const {
+	if (!mask) {
+		return 0;
+	}
+	idx_t idx = bucket_idx & mask;
+	if (bucket_slot_count <= 1) {
+		return idx;
+	}
+	return idx - (idx % bucket_slot_count);
+}
+
+void CuckooJoinHashTable::UpdateBucketGeometry() {
+	if (bucket_slot_count == 0) {
+		bucket_slot_count = 1;
+	}
+	if (capacity == 0) {
+		bucket_count = 0;
+		bucket_mask = 0;
+		mask = 0;
+		return;
+	}
+	if (capacity < bucket_slot_count) {
+		capacity = bucket_slot_count;
+	}
+	while (capacity % bucket_slot_count != 0) {
+		capacity <<= 1;
+	}
+	mask = capacity - 1;
+	bucket_count = capacity / bucket_slot_count;
+	bucket_mask = bucket_count > 0 ? bucket_count - 1 : 0;
+	UpdateVictimCapacity();
+}
+
+void CuckooJoinHashTable::UpdateVictimCapacity() {
+	if (capacity == 0) {
+		victim_capacity = 0;
+		return;
+	}
+	victim_capacity = MaxValue<idx_t>(capacity / 4, idx_t(1024));
+	if (victim_entries > victim_capacity) {
+		victim_mode = true;
+	}
+}
+
+void CuckooJoinHashTable::RelaxLoadFactor() {
+	if (observed_kickout) {
+		collision_free_sequence = 0;
+		return;
+	}
+	collision_free_sequence++;
+	if (collision_free_sequence >= 2048 && max_load_factor < configured_load_factor) {
+		max_load_factor = MinValue<double>(configured_load_factor, max_load_factor + 0.05);
+		collision_free_sequence = 0;
+	}
+}
+
+bool CuckooJoinHashTable::ShouldOverflowOnFailure() const {
+	if (capacity == 0) {
+		return true;
+	}
+	const idx_t kickout_threshold = MaxValue<idx_t>(idx_t(16), capacity / 256);
+	if (total_kickouts > kickout_threshold) {
+		return true;
+	}
+	const idx_t overflow_limit = MaxValue<idx_t>(capacity / 8, idx_t(2048));
+	if (overflow_entries >= overflow_limit) {
+		return false;
+	}
+	if (rehash_count >= max_rehash_attempts && size >= capacity / 8) {
+		return true;
+	}
+	return false;
+}
+
 } // namespace duckdb

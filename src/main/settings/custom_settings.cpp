@@ -1747,7 +1747,7 @@ void HashJoinCuckooLoadFactorSetting::SetLocal(ClientContext &context, const Val
 }
 
 void HashJoinCuckooLoadFactorSetting::ResetLocal(ClientContext &context) {
-	ClientConfig::GetConfig(context).hash_join_cuckoo_load_factor = 0.5;
+	ClientConfig::GetConfig(context).hash_join_cuckoo_load_factor = 0.75;
 }
 
 Value HashJoinCuckooLoadFactorSetting::GetSetting(const ClientContext &context) {
@@ -1772,6 +1772,47 @@ void HashJoinCuckooStashScaleSetting::ResetLocal(ClientContext &context) {
 
 Value HashJoinCuckooStashScaleSetting::GetSetting(const ClientContext &context) {
 	return Value::UBIGINT(ClientConfig::GetConfig(context).hash_join_cuckoo_stash_scale);
+}
+
+static idx_t ClampBucketSlots(uint64_t slots) {
+	if (slots == 0 || slots > 8) {
+		throw InvalidInputException("hash_join_cuckoo_bucket_slots must be 1, 2, 4 or 8. Provided value: %llu", slots);
+	}
+	idx_t clamped = 1;
+	while (clamped < slots && clamped < 8) {
+		clamped <<= 1;
+	}
+	return clamped;
+}
+
+void HashJoinCuckooBucketSlotsSetting::SetLocal(ClientContext &context, const Value &parameter) {
+	auto slots = ClampBucketSlots(parameter.GetValue<uint64_t>());
+	ClientConfig::GetConfig(context).hash_join_cuckoo_bucket_slots = slots;
+}
+
+void HashJoinCuckooBucketSlotsSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).hash_join_cuckoo_bucket_slots = 8;
+}
+
+Value HashJoinCuckooBucketSlotsSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(ClientConfig::GetConfig(context).hash_join_cuckoo_bucket_slots);
+}
+
+void HashJoinCuckooMaxSearchDepthSetting::SetLocal(ClientContext &context, const Value &parameter) {
+	auto depth = parameter.GetValue<uint64_t>();
+	if (depth < 8 || depth > 1024) {
+		throw InvalidInputException(
+		    "hash_join_cuckoo_max_search_depth must be between 8 and 1024. Provided value: %llu", depth);
+	}
+	ClientConfig::GetConfig(context).hash_join_cuckoo_max_search_depth = static_cast<idx_t>(depth);
+}
+
+void HashJoinCuckooMaxSearchDepthSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).hash_join_cuckoo_max_search_depth = 128;
+}
+
+Value HashJoinCuckooMaxSearchDepthSetting::GetSetting(const ClientContext &context) {
+	return Value::UBIGINT(ClientConfig::GetConfig(context).hash_join_cuckoo_max_search_depth);
 }
 
 } // namespace duckdb
