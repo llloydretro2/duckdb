@@ -364,9 +364,25 @@ tools/pythonpkg/duckdb_build/
 bench_hash_backend.duckdb
 data/job.duckdb
 data/job/**
+data/TPCDS/**
 data/tpch_sf1.duckdb
 job_perf/**
 job_query_benchmark/**
 job_query_profiles/**
 synthetic_perf/**
 job_query_focus/**
+tmp_profile/**
+
+# local benchmark/test orchestration scripts
+test/bash/bench_hash_backend.sh
+test/bash/job_cuckoo_perf.sh
+test/bash/job_queries_ab_perf.sh
+test/bash/job_queries_cuckoo_ab.sh
+test/bash/job_queries_cuckoo_focus.sh
+test/bash/job_queries_cuckoo_perf.sh
+test/bash/job_query_profile.sh
+test/bash/run_phase3_validation.sh
+test/bash/synthetic_cuckoo_perf.sh
+
+# local AI assistant state
+.aider*
